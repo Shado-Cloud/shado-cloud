@@ -37,6 +37,11 @@ const SMOKE_POLL_MS = 2_000;
 const SMOKE_CONFIG_FILE = ".smoke-config.yml";
 /** Prefix for throwaway build clones, so strays are identifiable in the temp dir. */
 const CLONE_PREFIX = "shado-build-";
+/**
+ * Sends every fetch over SSH regardless of the URL written in .gitmodules, which is HTTPS for all
+ * nine submodules. Applied per-invocation rather than by editing .gitmodules, which is shared.
+ */
+const SSH_REWRITE = ["-c", "url.git@github.com:.insteadOf=https://github.com/"];
 
 /**
  * Builds container images on the primary and proves they work before any replica is told to run
@@ -68,8 +73,23 @@ export class ImageBuildService {
     * Clone a repository into a temp directory for a clean build, returning the path and a
     * disposer that removes it.
     *
-    * Shallow, with shallow submodules: the build needs the current tree, not history, and a full
-    * clone of a nine-submodule superproject would move far more than necessary on every deploy.
+    * Shallow: the build needs the current tree, not history.
+    *
+    * Submodules are checked out at their TRACKED BRANCH TIP (`--remote`), not at the commit the
+    * superproject records. That difference is the whole point. A plain `--recurse-submodules`
+    * checks out the recorded gitlink at a detached HEAD, and nothing in this project ever advances
+    * those gitlinks: each service deploys itself with a `git pull` inside its own submodule
+    * directory, so the superproject pointer only moves when someone commits a pointer bump by
+    * hand. Building from the gitlink therefore shipped images built from whatever commit the
+    * pointer happened to be parked on — silently stale, with a passing build and a passing smoke
+    * test, so the only symptom was a fix that "did not work" on the replica.
+    *
+    * `.gitmodules` sets `branch = master` for all nine submodules, so `--remote` resolves to
+    * master explicitly rather than falling back to the remote's HEAD.
+    *
+    * `submodules` narrows the checkout to the paths the build context actually needs; omitting it
+    * initialises every submodule. Passing the one needed avoids cloning eight unrelated
+    * repositories on every deployment.
     *
     * The caller MUST call `dispose()` in a finally — a few hundred MB per deployment would
     * otherwise accumulate in the temp directory indefinitely.
@@ -78,6 +98,7 @@ export class ImageBuildService {
       repo: string,
       branch: string,
       onLog: (chunk: string) => void,
+      submodules?: string[],
    ): Promise<{ dir: string; dispose: () => void }> {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), CLONE_PREFIX));
       const dispose = (): void => {
@@ -93,14 +114,13 @@ export class ImageBuildService {
          await this.run(
             "git",
             [
-               // Every URL in .gitmodules is HTTPS, so --recurse-submodules would try to clone
-               // each submodule over HTTPS even when the superproject URL is SSH — and fail asking
-               // for a username. Rewriting at clone time keeps .gitmodules untouched (it is shared
-               // with everyone else's checkouts) while sending every fetch over SSH. `-c` travels
-               // to the submodule clones because git passes it down via GIT_CONFIG_PARAMETERS.
-               "-c", "url.git@github.com:.insteadOf=https://github.com/",
+               // Every URL in .gitmodules is HTTPS, so a submodule fetch would go over HTTPS even
+               // when the superproject URL is SSH — and fail asking for a username. Rewriting here
+               // keeps .gitmodules untouched (it is shared with everyone else's checkouts) while
+               // sending every fetch over SSH. `-c` travels to the submodule clones because git
+               // passes it down via GIT_CONFIG_PARAMETERS.
+               ...SSH_REWRITE,
                "clone", "--depth", "1", "--branch", branch,
-               "--recurse-submodules", "--shallow-submodules",
                repo, dir,
             ],
             os.tmpdir(),
@@ -109,11 +129,64 @@ export class ImageBuildService {
 
          const head = (await this.run("git", ["rev-parse", "--short", "HEAD"], dir)).trim();
          onLog(`Cloned at ${head}.\n`);
+
+         await this.checkoutSubmodules(dir, submodules ?? [], onLog);
          return { dir, dispose };
       } catch (e) {
          // Never leave a partial clone behind on failure.
          dispose();
          throw new Error(`Could not clone ${repo} (${branch}): ${(e as Error).message}${this.cloneHint(repo)}`);
+      }
+   }
+
+   /**
+    * Check out submodules at their tracked branch tip inside an existing clone.
+    *
+    * Logs the recorded gitlink alongside the commit actually checked out. When they differ, the
+    * superproject's pointer is behind its submodule's branch — which is the normal state here, and
+    * worth seeing in the deploy log rather than inferring later from a fix that appears to have no
+    * effect.
+    */
+   private async checkoutSubmodules(dir: string, paths: string[], onLog: (chunk: string) => void): Promise<void> {
+      const recorded = new Map<string, string>();
+      for (const p of paths) {
+         try {
+            // "160000 commit <sha>\t<path>"
+            const sha = (await this.run("git", ["rev-parse", `HEAD:${p}`], dir)).trim();
+            recorded.set(p, sha);
+         } catch {
+            // Not a submodule path, or no gitlink to compare against. The checkout below still runs
+            // and will report the real error if the path is wrong.
+         }
+      }
+
+      onLog(
+         paths.length
+            ? `Checking out ${paths.join(", ")} at the branch tracked in .gitmodules...\n`
+            : "Checking out all submodules at the branch tracked in .gitmodules...\n",
+      );
+      await this.run(
+         "git",
+         [
+            ...SSH_REWRITE,
+            "submodule", "update", "--init", "--remote", "--depth", "1",
+            ...(paths.length ? ["--", ...paths] : []),
+         ],
+         dir,
+         onLog,
+      );
+
+      for (const p of paths) {
+         const at = (await this.run("git", ["rev-parse", "HEAD"], path.join(dir, p))).trim();
+         const was = recorded.get(p);
+         if (was && was !== at) {
+            onLog(
+               `  ${p} at ${at.slice(0, 7)} (branch tip) — the superproject still records ` +
+               `${was.slice(0, 7)}, so a gitlink-pinned build would have been stale.\n`,
+            );
+         } else {
+            onLog(`  ${p} at ${at.slice(0, 7)}.\n`);
+         }
       }
    }
 

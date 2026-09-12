@@ -635,11 +635,26 @@ describe("DeploymentService", () => {
                "git@github.com:Shado-Cloud/Shado-Cloud-Services.git",
                "main",
                expect.any(Function),
+               ["shado-cloud"],
             );
             // Context is the subdirectory of the clone, NOT the primary's own checkout — that is
             // the whole point: the image must not pick up this host's config.yml or node_modules.
             expect(imageBuilder.build.mock.calls[0][0].workDir).toBe("/tmp/shado-build-xyz/shado-cloud");
             expect(imageBuilder.smokeTest.mock.calls[0][0].workDir).toBe("/tmp/shado-build-xyz/shado-cloud");
+         });
+
+         /*
+          * The build context is a submodule, and NOTHING in this project advances the
+          * superproject's gitlinks — each service deploys itself with a `git pull` inside its own
+          * submodule directory. So the submodule to build must be named to cloneSource, which
+          * checks it out at its branch tip; otherwise the build silently used whatever commit the
+          * pointer was parked on. That produced images four commits behind master that built
+          * clean and passed the smoke test, so the only visible symptom was a fix that appeared to
+          * have no effect on the replica.
+          */
+         it("names the context submodule so it is checked out at its branch tip, not the gitlink", async () => {
+            await runToBuild();
+            expect(imageBuilder.cloneSource.mock.calls[0][3]).toEqual(["shado-cloud"]);
          });
 
          it("deletes the clone after a successful build", async () => {
@@ -675,7 +690,7 @@ describe("DeploymentService", () => {
             await runToBuild();
 
             // makeProject sets branch "master".
-            expect(imageBuilder.cloneSource).toHaveBeenCalledWith(expect.any(String), "master", expect.any(Function));
+            expect(imageBuilder.cloneSource).toHaveBeenCalledWith(expect.any(String), "master", expect.any(Function), ["shado-cloud"]);
          });
 
          it("fails the step, without building, when the clone fails", async () => {

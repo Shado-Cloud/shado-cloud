@@ -953,7 +953,14 @@ export class DeploymentService implements OnModuleInit {
       let buildDir = workDir;
       if (stepConfig.sourceRepo) {
          const branch = stepConfig.sourceBranch ?? projectBranch ?? "master";
-         const clone = await this.imageBuilder.cloneSource(stepConfig.sourceRepo, branch, appendLog);
+         // The build context lives in a submodule, so that submodule has to be checked out at its
+         // branch tip — the superproject's recorded gitlink is not maintained by this pipeline.
+         const clone = await this.imageBuilder.cloneSource(
+            stepConfig.sourceRepo,
+            branch,
+            appendLog,
+            stepConfig.contextSubdir ? [stepConfig.contextSubdir] : [],
+         );
          disposeClone = clone.dispose;
          buildDir = stepConfig.contextSubdir ? path.join(clone.dir, stepConfig.contextSubdir) : clone.dir;
       }
