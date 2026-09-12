@@ -102,7 +102,31 @@ const REDIS_KEY_STEPS_VERSION = "deployment:seeded-steps-version";
  * hand-added in the admin UI on every environment, which is exactly the kind of manual step that
  * gets forgotten and then presents as a pipeline that silently does nothing.
  */
-const DEFAULT_STEPS_VERSION = 2;
+const DEFAULT_STEPS_VERSION = 3;
+
+/**
+ * SSH rather than HTTPS. An HTTPS clone needs a username and token, and running unattended there
+ * is no terminal to supply them — git then fails with "could not read Username ... No such device
+ * or address", which describes the missing TTY rather than the missing credential. SSH uses the
+ * service user's key, and .gitmodules' HTTPS URLs are rewritten at clone time.
+ */
+const SERVICES_REPO_SSH = "git@github.com:Shado-Cloud/Shado-Cloud-Services.git";
+
+/**
+ * Corrections to values THIS CODE previously seeded, applied once per version bump.
+ *
+ * Field-level reconciliation only fills in what is absent, so it cannot repair a default that was
+ * wrong when it was written. These replace an exact prior default and nothing else — a value the
+ * operator chose never matches, so it is never touched.
+ */
+const LEGACY_STEP_VALUE_FIXUPS: { step: string; field: keyof DeploymentStepConfig; from: string; to: string }[] = [
+   {
+      step: "propagate_replicas",
+      field: "sourceRepo",
+      from: "https://github.com/Shado-Cloud/Shado-Cloud-Services.git",
+      to: SERVICES_REPO_SSH,
+   },
+];
 
 /**
  * A sibling package of the primary's own checkout, e.g. `__CWD__/../shado-auth-api`.
@@ -205,7 +229,7 @@ const DEFAULT_PROJECTS: Partial<DeploymentProject>[] = [
             args: [],
             propagateToReplicas: true,
             buildImage: true,
-            sourceRepo: "https://github.com/Shado-Cloud/Shado-Cloud-Services.git",
+            sourceRepo: SERVICES_REPO_SSH,
             sourceBranch: "main",
             contextSubdir: "shado-cloud",
             dockerfile: "../Dockerfile.shado-cloud",
@@ -327,7 +351,16 @@ export class DeploymentService implements OnModuleInit {
       const changes: string[] = [];
       const merged = [...current];
 
-      // 1. Fill in fields a step is missing.
+      // 1. Repair values a previous version of this code seeded incorrectly.
+      for (const fix of LEGACY_STEP_VALUE_FIXUPS) {
+         const step = merged.find((s) => s.step === fix.step);
+         if (step && (step as unknown as Record<string, unknown>)[fix.field] === fix.from) {
+            (step as unknown as Record<string, unknown>)[fix.field] = fix.to;
+            changes.push(`${fix.step}.${String(fix.field)}→${fix.to}`);
+         }
+      }
+
+      // 2. Fill in fields a step is missing.
       for (const step of merged) {
          const defStep = defaults.find((d) => d.step === step.step);
          if (!defStep) continue;
@@ -338,7 +371,7 @@ export class DeploymentService implements OnModuleInit {
          if (added.length > 0) changes.push(`${step.step}{${added.join(",")}}`);
       }
 
-      // 2. Insert steps the project lacks entirely, after the last preceding default step it has,
+      // 3. Insert steps the project lacks entirely, after the last preceding default step it has,
       //    so relative order matches the defaults without assuming indexes.
       const have = new Set(merged.map((s) => s.step));
       for (const step of defaults.filter((s) => !have.has(s.step))) {

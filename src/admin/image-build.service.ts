@@ -92,7 +92,17 @@ export class ImageBuildService {
          onLog(`Cloning ${repo} (${branch}) into ${dir}...\n`);
          await this.run(
             "git",
-            ["clone", "--depth", "1", "--branch", branch, "--recurse-submodules", "--shallow-submodules", repo, dir],
+            [
+               // Every URL in .gitmodules is HTTPS, so --recurse-submodules would try to clone
+               // each submodule over HTTPS even when the superproject URL is SSH — and fail asking
+               // for a username. Rewriting at clone time keeps .gitmodules untouched (it is shared
+               // with everyone else's checkouts) while sending every fetch over SSH. `-c` travels
+               // to the submodule clones because git passes it down via GIT_CONFIG_PARAMETERS.
+               "-c", "url.git@github.com:.insteadOf=https://github.com/",
+               "clone", "--depth", "1", "--branch", branch,
+               "--recurse-submodules", "--shallow-submodules",
+               repo, dir,
+            ],
             os.tmpdir(),
             onLog,
          );
@@ -103,8 +113,35 @@ export class ImageBuildService {
       } catch (e) {
          // Never leave a partial clone behind on failure.
          dispose();
-         throw new Error(`Could not clone ${repo} (${branch}): ${(e as Error).message}`);
+         throw new Error(`Could not clone ${repo} (${branch}): ${(e as Error).message}${this.cloneHint(repo)}`);
       }
+   }
+
+   /**
+    * Turn an authentication failure into something actionable. The pipeline runs unattended under
+    * a process manager, so the usual signals (a prompt, an interactive retry) are absent and the
+    * raw git error is misleading — an HTTPS clone with no credentials reports
+    * "could not read Username ... No such device or address", which describes the missing TTY
+    * rather than the missing credential.
+    */
+   private cloneHint(repo: string): string {
+      if (repo.startsWith("git@") || repo.startsWith("ssh://")) {
+         return (
+            "\n\nSSH clone failed. Check, as the user this service runs as" +
+            ` (currently ${os.userInfo().username}, HOME=${os.homedir()}):` +
+            "\n  - a usable key exists in ~/.ssh (a key set up for your login user is NOT visible" +
+            " to a different service user)" +
+            "\n  - `ssh -T git@github.com` succeeds for that user" +
+            "\n  - github.com is in ~/.ssh/known_hosts, or the key has no passphrase / an agent is" +
+            " reachable via SSH_AUTH_SOCK" +
+            `\n  - SSH_AUTH_SOCK is ${process.env.SSH_AUTH_SOCK ? "set" : "NOT set in this process"}`
+         );
+      }
+      return (
+         "\n\nHTTPS clone failed, which needs a username and token — SSH keys do not apply to an" +
+         " https:// URL. Either switch the step's source repo to git@github.com:… or configure a" +
+         " credential helper for the user this service runs as."
+      );
    }
 
    /** Build an image and return its image ID. */
@@ -302,13 +339,46 @@ export class ImageBuildService {
       return (await this.runBoth(cmd, args, cwd, onLog)).stdout;
    }
 
+   /**
+    * Minimal environment for spawned git/docker, deliberately not the full process env.
+    *
+    * The SSH bits matter: HOME alone finds on-disk keys and ~/.ssh/config, but a passphrase-
+    * protected key needs the agent, and the agent is only reachable through SSH_AUTH_SOCK. Losing
+    * that variable turns a working SSH setup into an authentication failure with no obvious cause.
+    *
+    * GIT_TERMINAL_PROMPT=0 makes a missing credential say so. Without it git tries to prompt, and
+    * because this runs unattended with no TTY the failure surfaces as
+    * "could not read Username ... No such device or address" — which describes the absent terminal
+    * rather than the absent credential, and sends you looking in the wrong place.
+    *
+    * StrictHostKeyChecking=accept-new so a host never seen before is trusted on first contact
+    * instead of blocking on a confirmation nobody can answer. It still refuses a CHANGED host key,
+    * which is the case that actually signals interception.
+    */
+   private childEnv(): NodeJS.ProcessEnv {
+      return {
+         PATH: process.env.PATH,
+         HOME: process.env.HOME,
+         DOCKER_BUILDKIT: "0",
+         // Never prompt; fail with a readable error instead.
+         GIT_TERMINAL_PROMPT: "0",
+         GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND ?? "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
+         // ssh-agent, when the service user has one.
+         ...(process.env.SSH_AUTH_SOCK ? { SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK } : {}),
+         ...(process.env.SSH_AGENT_PID ? { SSH_AGENT_PID: process.env.SSH_AGENT_PID } : {}),
+         // Some ssh configurations resolve the default identity via these.
+         ...(process.env.USER ? { USER: process.env.USER } : {}),
+         ...(process.env.LOGNAME ? { LOGNAME: process.env.LOGNAME } : {}),
+      };
+   }
+
    private runBoth(cmd: string, args: string[], cwd: string, onLog?: (chunk: string) => void): Promise<{ stdout: string; stderr: string }> {
       const stripAnsi = (s: string): string => s.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, "");
       return new Promise((resolve, reject) => {
          const proc = spawn(cmd, args, {
             cwd,
             stdio: ["ignore", "pipe", "pipe"],
-            env: { PATH: process.env.PATH, HOME: process.env.HOME, DOCKER_BUILDKIT: "0" },
+            env: this.childEnv(),
          });
          let stdout = "";
          let stderr = "";

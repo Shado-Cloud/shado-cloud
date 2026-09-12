@@ -50,7 +50,7 @@ const backendSteps = [
       args: [],
       propagateToReplicas: true,
       buildImage: true,
-      sourceRepo: "https://github.com/Shado-Cloud/Shado-Cloud-Services.git",
+      sourceRepo: "git@github.com:Shado-Cloud/Shado-Cloud-Services.git",
       sourceBranch: "main",
       contextSubdir: "shado-cloud",
       dockerfile: "../Dockerfile.shado-cloud",
@@ -612,7 +612,7 @@ describe("DeploymentService", () => {
             s.step === "propagate_replicas"
                ? {
                     ...s,
-                    sourceRepo: "https://github.com/Shado-Cloud/Shado-Cloud-Services.git",
+                    sourceRepo: "git@github.com:Shado-Cloud/Shado-Cloud-Services.git",
                     sourceBranch: "main",
                     contextSubdir: "shado-cloud",
                  }
@@ -632,7 +632,7 @@ describe("DeploymentService", () => {
             await runToBuild();
 
             expect(imageBuilder.cloneSource).toHaveBeenCalledWith(
-               "https://github.com/Shado-Cloud/Shado-Cloud-Services.git",
+               "git@github.com:Shado-Cloud/Shado-Cloud-Services.git",
                "main",
                expect.any(Function),
             );
@@ -680,7 +680,7 @@ describe("DeploymentService", () => {
 
          it("fails the step, without building, when the clone fails", async () => {
             imageBuilder.cloneSource.mockRejectedValue(
-               new Error("Could not clone https://github.com/Shado-Cloud/Shado-Cloud-Services.git (main): authentication failed"),
+               new Error("Could not clone git@github.com:Shado-Cloud/Shado-Cloud-Services.git (main): authentication failed"),
             );
 
             await runToBuild();
@@ -766,6 +766,35 @@ describe("DeploymentService", () => {
          const test = steps.find(s => s.step === "test");
          expect(test?.skip).toBe(true);
          expect(test?.args).toEqual(["test", "--custom"]);
+      });
+
+      it("rewrites a source repo this code previously seeded with the wrong scheme", async () => {
+         // An HTTPS clone needs a username and token, and unattended there is no terminal to
+         // supply them — field-level merging cannot fix this, since the field is already present.
+         const legacy = backendSteps.map(s =>
+            s.step === "propagate_replicas"
+               ? { ...s, sourceRepo: "https://github.com/Shado-Cloud/Shado-Cloud-Services.git" }
+               : s,
+         );
+         projectRepo.findOneBy.mockResolvedValue(makeProject("backend", legacy));
+
+         await service.onModuleInit();
+
+         const step = (projectRepo.save.mock.calls.at(-1)[0] as DeploymentProject)
+            .getSteps().find(s => s.step === "propagate_replicas");
+         expect(step?.sourceRepo).toBe("git@github.com:Shado-Cloud/Shado-Cloud-Services.git");
+      });
+
+      it("leaves a source repo the operator chose alone", async () => {
+         // Only an exact prior default is replaced, so a deliberate choice is never overwritten.
+         const custom = backendSteps.map(s =>
+            s.step === "propagate_replicas" ? { ...s, sourceRepo: "git@git.internal:me/mirror.git" } : s,
+         );
+         projectRepo.findOneBy.mockResolvedValue(makeProject("backend", custom));
+
+         await service.onModuleInit();
+
+         expect(projectRepo.save).not.toHaveBeenCalled();
       });
 
       it("does nothing when the project already has every default step", async () => {
