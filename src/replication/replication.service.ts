@@ -3,7 +3,7 @@ import { ConfigService } from "@nestjs/config";
 import { Cron, CronExpression } from "@nestjs/schedule";
 import { EnvVariables, ReplicationRole } from "src/config/config.validator";
 import { signServiceHeaders } from "src/auth/service-auth.util";
-import { AbstractFileSystem } from "src/file-system/abstract-file-system.interface";
+import { AbstractFileSystem, type State } from "src/file-system/abstract-file-system.interface";
 import * as path from "path";
 import {
     createCipheriv,
@@ -20,6 +20,25 @@ import { EmailService } from "src/admin/email.service";
 import { createConnection } from "mysql2/promise";
 import * as os from "os";
 import * as readline from "readline";
+
+/**
+ * Response header on `/replication/listall` telling the replica whether the master's walk of its
+ * cloud dir saw everything ("1") or skipped entries it could not resolve ("0").
+ *
+ * A header rather than a change to the JSON body, so that master and replica can be upgraded in
+ * either order: a replica that predates this treats the body exactly as before, and a master that
+ * predates it sends no header — which is read as complete, i.e. the old behaviour.
+ */
+export const LISTING_COMPLETE_HEADER = "x-listing-complete";
+
+/** One file in a cloud-dir listing, as exchanged between master and replica. */
+export interface CloudFileEntry {
+   name: string;
+   /** Path relative to the cloud dir, using the lister's separator. */
+   path: string;
+   /** Real byte size. For a cold-tiered file this is the size of the cold blob, not the symlink. */
+   size: number;
+}
 
 /** Metadata the master keeps (in Redis) about each replica that requests replication. */
 interface ReplicaRecord {
@@ -145,9 +164,26 @@ export class ReplicationService implements OnModuleInit {
             }
 
             // Files to delete (never delete ignored paths)
-            const masterDoesNotHave = replicaFiles.filter(
-               (e) => !masterFiles.find((f) => this.pathEquals(f.path, e.path)) && !this.isIgnored(e.path),
-            );
+            //
+            // Gated on the master reporting a COMPLETE listing. A file the master could not resolve
+            // — a cold-tiered file whose drive is unmounted, say — is missing from masterFiles but
+            // is emphatically not deleted, and unlinking the replica's copy would destroy the only
+            // reachable copy of those bytes. An unmounted cold drive would otherwise wipe every
+            // cold file from every replica on the next pass.
+            const masterListingComplete = listAllResponse.headers.get(LISTING_COMPLETE_HEADER) !== "0";
+            if (!masterListingComplete) {
+               this.logger.warn(
+                  "Master reported an INCOMPLETE file listing, so deletions are suppressed for this pass. " +
+                  "Files it could not resolve are not treated as deleted. Check the master's logs for " +
+                  "skipped entries — an unmounted cold-storage drive is the usual cause.",
+               );
+            }
+
+            const masterDoesNotHave = !masterListingComplete
+               ? []
+               : replicaFiles.filter(
+                  (e) => !masterFiles.find((f) => this.pathEquals(f.path, e.path)) && !this.isIgnored(e.path),
+               );
             this.logger.log(`${masterDoesNotHave.length} Files to delete`);
             let filesDeleted = 0;
             for (const file of masterDoesNotHave) {
@@ -171,7 +207,27 @@ export class ReplicationService implements OnModuleInit {
    }
 
    public async listCloudDir() {
-      return this.listRecusively(this.cloudDir);
+      return (await this.listCloudDirDetailed()).files;
+   }
+
+   /**
+    * Same walk as `listCloudDir`, plus whether it saw everything.
+    *
+    * `complete: false` means at least one entry could not be resolved — most likely a cold-storage
+    * drive that is not mounted, which makes every file on it look absent. A consumer that treats
+    * absence as deletion (the replica's delete phase) MUST NOT act on an incomplete listing.
+    */
+   public async listCloudDirDetailed(): Promise<{ files: CloudFileEntry[]; complete: boolean }> {
+      const report = { skipped: 0 };
+      const files = await this.listRecusively(this.cloudDir, report);
+      if (report.skipped > 0) {
+         this.logger.warn(
+            `Listing of ${this.cloudDir} is INCOMPLETE: ${report.skipped} entr${report.skipped === 1 ? "y" : "ies"} ` +
+            "could not be resolved. Deletions will be suppressed for this pass, because an unresolvable " +
+            "file is not a deleted file.",
+         );
+      }
+      return { files, complete: report.skipped === 0 };
    }
 
    // ───────────────────────── Replica registry (master) ─────────────────────────
@@ -682,53 +738,81 @@ export class ReplicationService implements OnModuleInit {
    /**
     * Recursively list files under `path_`, relative to the cloud dir.
     *
-    * Entries that cannot be stat'd are SKIPPED with a warning rather than aborting. readdir can
-    * legitimately report something stat cannot resolve: a broken symlink, a Windows junction or
-    * reparse point that does not translate into a Linux container, an entry removed between the
-    * listing and the stat, or a bind-mount filesystem returning DT_UNKNOWN so an entry is
-    * misclassified. Any one of those used to throw ENOENT out of the whole walk, which aborted the
-    * replication pass — so a single unreadable entry meant NOTHING replicated, and the log said
-    * only "no such file or directory".
+    * COLD STORAGE: a file demoted by TieredStorageService is replaced in place by a symlink to
+    * `/mnt/<drive>/cloud-dir/<rel>`, and the rest of the app is meant to be unaware of it — "reads,
+    * stats and directory listings just work" because the kernel resolves the link. So a symlink
+    * here is an ordinary file that happens to live on the cold drive, and it MUST be listed:
+    * `statSync` follows the link and reports the real size of the cold blob. Classifying it as a
+    * symlink and skipping it silently drops every cold file from replication, and — because the
+    * replica treats "absent from the master's list" as "deleted on the master" — makes the replica
+    * unlink its own good copies. Tiering activity alone would then destroy the backup.
     *
-    * Symlinks are skipped deliberately: copying a link's target under the link's name would give
-    * the replica different content from the master, and following one out of the cloud dir would
-    * replicate files from outside it.
+    * Entries that cannot be resolved are SKIPPED and counted in `report.skipped` rather than
+    * aborting: readdir can legitimately report something stat cannot resolve — a cold symlink
+    * whose drive is not mounted, a Windows junction that does not translate into a Linux container,
+    * an entry removed between the listing and the stat, or a bind mount returning DT_UNKNOWN. Any
+    * one of those used to throw out of the whole walk, so a single bad entry meant NOTHING
+    * replicated.
+    *
+    * `report.skipped` is what makes that safe: an incomplete listing must never be read as
+    * "the master deleted these files". See `replicate`.
+    *
+    * Directory symlinks are skipped. Tiering only ever demotes files, so one is not ours, and
+    * following it risks a cycle or a walk out of the cloud dir.
     */
-   private async listRecusively(path_: string) {
+   private async listRecusively(path_: string, report: { skipped: number }) {
       const cloudDir = this.config.get("this-service.cloud-dir", { infer: true });
       let entries: ReturnType<AbstractFileSystem["readdirSync"]>;
       try {
          entries = this.fs.readdirSync(path_);
       } catch (e) {
+         report.skipped++;
          this.logger.warn(`Skipping unreadable directory ${path_}: ${(e as Error).message}`);
          return [];
       }
 
-      const files: { name: string; path: string; size: number }[] = [];
+      const files: CloudFileEntry[] = [];
       const folders: typeof entries = [];
 
       for (const entry of entries) {
          const full = path_ + "/" + entry.name;
 
-         // Classify by lstat rather than trusting the Dirent: some bind-mount filesystems report
-         // DT_UNKNOWN, which makes isDirectory() false for real directories.
+         // A Dirent reflects lstat, so a cold file reports isSymbolicLink() and NOT isFile().
          let isDir = entry.isDirectory();
          let isLink = entry.isSymbolicLink();
          if (!isDir && !isLink) {
+            // Some bind-mount filesystems report DT_UNKNOWN, which makes isDirectory() false for
+            // real directories.
             try {
                const st = this.fs.lstatSync(full);
                isDir = st.isDirectory();
                isLink = st.isSymbolicLink();
             } catch (e) {
+               report.skipped++;
                this.logger.warn(`Skipping ${full}: ${(e as Error).message}`);
                continue;
             }
          }
 
          if (isLink) {
-            this.logger.warn(`Skipping symlink ${full} (replicating a link's target under its name would diverge from the master)`);
+            // Follow it — this is how a cold-tiered file gets its real size.
+            let target: State;
+            try {
+               target = this.fs.statSync(full);
+            } catch (e) {
+               report.skipped++;
+               this.logger.warn(`Skipping ${full}: ${(e as Error).message}${this.unresolvedLinkHint(full)}`);
+               continue;
+            }
+            if (target.isDirectory()) {
+               report.skipped++;
+               this.logger.warn(`Skipping directory symlink ${full} (tiering only demotes files, so this is not a cold file)`);
+               continue;
+            }
+            files.push({ name: entry.name, path: path.relative(cloudDir, full), size: target.size });
             continue;
          }
+
          if (isDir) {
             folders.push(entry);
             continue;
@@ -742,6 +826,7 @@ export class ReplicationService implements OnModuleInit {
                size: this.fs.statSync(full).size,
             });
          } catch (e) {
+            report.skipped++;
             this.logger.warn(`Skipping ${full}: ${(e as Error).message}`);
          }
       }
@@ -751,9 +836,26 @@ export class ReplicationService implements OnModuleInit {
        * current function itself
        */
       for (const folder of folders) {
-         files.push(...(await this.listRecusively(path.join(path_, folder.name))));
+         files.push(...(await this.listRecusively(path.join(path_, folder.name), report)));
       }
       return files;
+   }
+
+   /**
+    * Explains an unresolvable symlink in terms of cold storage, which is the only thing in this
+    * system that creates one. "no such file or directory" on a path that readdir just listed is
+    * otherwise baffling; the useful fact is that the bytes live on a drive that is not mounted.
+    */
+   private unresolvedLinkHint(full: string): string {
+      try {
+         const target = this.fs.readlinkSync(full);
+         return (
+            ` — it is a symlink to ${target}, which does not resolve. If that is a cold-storage` +
+            " drive, it is not mounted, so the file's bytes are currently unreachable."
+         );
+      } catch {
+         return "";
+      }
    }
 
    private isMaster() {

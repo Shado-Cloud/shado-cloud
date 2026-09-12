@@ -795,13 +795,35 @@ export class FilesService {
       const locations: BackupLocation[] = [];
 
       // 1) Primary copy (cloud-dir on this node)
-      const primaryExists = this.fs.existsSync(absolute);
-      locations.push({
-         kind: "primary",
-         label: "Cloud storage",
-         present: primaryExists,
-         detail: primaryExists ? "Primary copy" : "Missing from primary storage",
-      });
+      //
+      // A cold-tiered file IS a symlink to the cold drive, and existsSync follows it — so when that
+      // drive is unmounted the file would be reported as "Missing from primary storage", which is
+      // both alarming and wrong: the bytes exist, the drive is just not attached. Distinguish
+      // unreachable from absent the same way the mirror-disk branch below already does, by checking
+      // for the entry itself with lstat (which does not follow).
+      const primaryReachable = this.fs.existsSync(absolute);
+      let primaryEntryPresent = primaryReachable;
+      if (!primaryReachable) {
+         try {
+            this.fs.lstatSync(absolute);
+            primaryEntryPresent = true;
+         } catch {
+            primaryEntryPresent = false;
+         }
+      }
+
+      if (primaryReachable) {
+         locations.push({ kind: "primary", label: "Cloud storage", present: true, detail: "Primary copy" });
+      } else if (primaryEntryPresent) {
+         locations.push({
+            kind: "primary",
+            label: "Cloud storage",
+            present: null,
+            detail: "In cold storage — drive not mounted / unavailable",
+         });
+      } else {
+         locations.push({ kind: "primary", label: "Cloud storage", present: false, detail: "Missing from primary storage" });
+      }
 
       // 2) Local mirror disks (this node's config)
       const mirrorDirs = this.config.get("this-service.replication.mirror-dirs", { infer: true }) ?? [];

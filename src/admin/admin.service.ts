@@ -517,8 +517,17 @@ export class AdminService {
          if (file.isDirectory()) {
             size += await this.getDirSize(filePath);
          } else {
-            const stat = this.fs.statSync(filePath);
-            size += stat.size;
+            // statSync (not lstat) so a cold-tiered file — a symlink to the cold drive — is measured
+            // by its real bytes rather than by the length of the link target.
+            //
+            // Skip what will not resolve instead of aborting: an unmounted cold drive makes every
+            // file on it unresolvable at once, and a disk-usage total is not worth failing the whole
+            // admin dashboard over.
+            try {
+               size += this.fs.statSync(filePath).size;
+            } catch (e) {
+               this.logger.warn(`Excluding ${filePath} from the size total: ${(e as Error).message}`);
+            }
          }
       }
       return size;

@@ -306,4 +306,141 @@ describe("TieredStorageService", () => {
          expect(overview.redis).toEqual({ usedMemory: 1000, maxMemory: 2000 });
       });
    });
+
+   /**
+    * `coldStats` is what the UI uses to say "N of M files are in cold storage", and it is the one
+    * place that is SUPPOSED to distinguish a cold symlink from a hot file. Everything else in the
+    * app must treat them identically — which is the distinction that got inverted in the
+    * replication walk and silently dropped every cold file from the backup.
+    */
+   describe("coldStats", () => {
+      it("counts a cold symlink as a file, and as cold", () => {
+         fsMock.readdirSync.mockImplementation((dir: string) =>
+            dir === "/cloud" ? [dirent("hot.txt"), symlinkDirent("cold.mkv")] : [],
+         );
+         fsMock.lstatSync.mockReturnValue({ isSymbolicLink: () => true, isDirectory: () => false });
+         fsMock.readlinkSync.mockReturnValue("/mnt/coldhdd/cloud-dir/cold.mkv");
+
+         // A cold file is still a file: total counts both, cold counts only the symlink.
+         expect(service.coldStats("/cloud")).toEqual({ total: 2, cold: 1 });
+      });
+
+      it("does not count a symlink pointing outside cold storage as cold", () => {
+         fsMock.readdirSync.mockImplementation((dir: string) =>
+            dir === "/cloud" ? [symlinkDirent("elsewhere")] : [],
+         );
+         fsMock.lstatSync.mockReturnValue({ isSymbolicLink: () => true, isDirectory: () => false });
+         fsMock.readlinkSync.mockReturnValue("/home/user/somewhere-else");
+
+         // Still a file, but not a tiered one — cold accounting must not over-report.
+         expect(service.coldStats("/cloud")).toEqual({ total: 1, cold: 0 });
+      });
+
+      it("recurses into subdirectories", () => {
+         fsMock.readdirSync.mockImplementation((dir: string) => {
+            if (dir === "/cloud") return [dirent("user", true)];
+            if (dir === "/cloud/user") return [dirent("a.txt"), symlinkDirent("b.mkv")];
+            return [];
+         });
+         fsMock.lstatSync.mockReturnValue({ isSymbolicLink: () => true, isDirectory: () => false });
+         fsMock.readlinkSync.mockReturnValue("/mnt/coldhdd/cloud-dir/user/b.mkv");
+
+         expect(service.coldStats("/cloud")).toEqual({ total: 2, cold: 1 });
+      });
+
+      it("ignores hidden and internal entries", () => {
+         fsMock.readdirSync.mockImplementation((dir: string) =>
+            dir === "/cloud" ? [dirent(".meta"), dirent("_system"), dirent("real.txt")] : [],
+         );
+
+         // Thumbnails and internal folders are not user files and would inflate the totals.
+         expect(service.coldStats("/cloud")).toEqual({ total: 1, cold: 0 });
+      });
+
+      it("returns zeros for an unreadable directory instead of throwing", () => {
+         fsMock.readdirSync.mockImplementation(() => {
+            throw new Error("EACCES: permission denied");
+         });
+
+         expect(service.coldStats("/cloud")).toEqual({ total: 0, cold: 0 });
+      });
+   });
+
+   describe("isColdFile", () => {
+      it("is true for a symlink whose target is on a configured cold drive", () => {
+         fsMock.lstatSync.mockReturnValue({ isSymbolicLink: () => true, isDirectory: () => false });
+         fsMock.readlinkSync.mockReturnValue("/mnt/coldhdd/cloud-dir/movie.mkv");
+
+         expect(service.isColdFile("/cloud/movie.mkv")).toBe(true);
+      });
+
+      it("is false for a hot file", () => {
+         fsMock.lstatSync.mockReturnValue({ isSymbolicLink: () => false, isDirectory: () => false });
+
+         expect(service.isColdFile("/cloud/movie.mkv")).toBe(false);
+      });
+
+      it("is false for a symlink to an unconfigured drive", () => {
+         fsMock.lstatSync.mockReturnValue({ isSymbolicLink: () => true, isDirectory: () => false });
+         fsMock.readlinkSync.mockReturnValue("/mnt/someotherdrive/cloud-dir/movie.mkv");
+
+         expect(service.isColdFile("/cloud/movie.mkv")).toBe(false);
+      });
+
+      it("is false — not a throw — for a path that does not exist", () => {
+         fsMock.lstatSync.mockImplementation(() => {
+            throw new Error("ENOENT: no such file or directory");
+         });
+
+         // Callers use this as a predicate on the request path; it must never throw.
+         expect(service.isColdFile("/cloud/gone.mkv")).toBe(false);
+      });
+   });
+
+   describe("getOverview — drives", () => {
+      it("reports cold file count, cold bytes and disk usage per configured drive", async () => {
+         fsMock.readdirSync.mockImplementation((dir: string) =>
+            dir === "/mnt/coldhdd/cloud-dir" ? [dirent("a.mkv"), dirent("b.mkv")] : [],
+         );
+         fsMock.statSync.mockReturnValue({ size: 1_000_000, atimeMs: Date.now() });
+         fsMock.statfsSync.mockReturnValue({ blocks: 1000, bavail: 400, bsize: 4096 });
+
+         const overview = await service.getOverview();
+
+         expect(overview.drives).toHaveLength(1);
+         expect(overview.drives[0]).toEqual({
+            name: "coldhdd",
+            mountPoint: "/mnt/coldhdd",
+            coldFileCount: 2,
+            coldBytes: 2_000_000,
+            total: 4_096_000,
+            free: 1_638_400,
+            used: 4_096_000 - 1_638_400,
+         });
+      });
+
+      it("reports zero usage when the cold drive is not mounted", async () => {
+         fsMock.readdirSync.mockReturnValue([]);
+         fsMock.statfsSync.mockImplementation(() => {
+            throw new Error("ENOENT: no such file or directory, statfs '/mnt/coldhdd/cloud-dir'");
+         });
+
+         const overview = await service.getOverview();
+
+         // The admin page has to render while a drive is unplugged rather than 500.
+         expect(overview.drives[0]).toEqual(
+            expect.objectContaining({ name: "coldhdd", coldFileCount: 0, coldBytes: 0, total: 0, free: 0, used: 0 }),
+         );
+      });
+
+      it("surfaces both feature flags", async () => {
+         featureFlag.isFeatureFlagEnabled.mockImplementation(async (_ns: unknown, flag: string) =>
+            flag === "tiered_storage_demotion",
+         );
+
+         const overview = await service.getOverview();
+
+         expect(overview.flags).toEqual({ demotion: true, promotion: false });
+      });
+   });
 });

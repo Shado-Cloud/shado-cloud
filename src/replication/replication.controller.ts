@@ -1,5 +1,5 @@
 import { Body, Controller, Get, Param, Req, Res, UseGuards } from "@nestjs/common";
-import { ReplicationService } from "./replication.service";
+import { ReplicationService, LISTING_COMPLETE_HEADER } from "./replication.service";
 import { ApiTags } from "@nestjs/swagger";
 import { SkipThrottle } from "@nestjs/throttler";
 import { ServiceKeyGuard } from "src/auth/service-key.guard";
@@ -26,7 +26,7 @@ export class ReplicationController {
    /** Master: list every file in cloud-dir, and record the calling replica in the registry. */
    @Get("listall")
    @UseGuards(ServiceKeyGuard)
-   public async listall(@Req() req: Request) {
+   public async listall(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
       // The replica self-reports its device name and mirror-disk count via headers; the
       // master combines device name + resolved client IP to identify it (handles two
       // replicas behind one IP). IP honors CF-Connecting-IP behind a tunnel.
@@ -43,7 +43,12 @@ export class ReplicationController {
          Number.isFinite(mirrorDirs) ? mirrorDirs : undefined,
          deviceName,
       );
-      return this.replicationService.listCloudDir();
+      // Tell the replica whether this listing is trustworthy enough to delete from. An entry the
+      // master cannot resolve (a cold-tiered file on an unmounted drive) is absent from the body but
+      // is not deleted, and the replica must not unlink its copy on that basis.
+      const { files, complete } = await this.replicationService.listCloudDirDetailed();
+      res.setHeader(LISTING_COMPLETE_HEADER, complete ? "1" : "0");
+      return files;
    }
 
    /** Manually trigger a replication pass (normally driven by the per-minute cron). */
