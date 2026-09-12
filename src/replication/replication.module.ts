@@ -3,7 +3,10 @@ import { ReplicationService } from "./replication.service";
 import { GoogleDriveBackupService } from "./google-drive-backup.service";
 import { TrustedIpMiddleware } from "./trusted-ip.middleware";
 import { ReplicationController } from "./replication.controller";
+import { HealthController } from "src/health/health.controller";
 import { ReplicaLinkClient } from "./replica-link.client";
+import { ReplicaDeployRunner } from "./replica-deploy.runner";
+import { ImageArtifactService } from "./image-artifact.service";
 import { ConditionalModule, ConfigModule, ConfigService } from "@nestjs/config";
 import { AbstractFileSystem } from "src/file-system/abstract-file-system.interface";
 import { NodeFileSystemService } from "src/file-system/file-system.service";
@@ -34,7 +37,10 @@ import { SignedServiceSerializer } from "src/auth/service-auth.util";
  *                                and database on a cron; the master serves them.
  *  - {@link ReplicationController} the HTTP endpoints the replica pulls from.
  *  - {@link ReplicaLinkClient}   replica-side socket that answers live "do you have this
- *                                file?" queries from the master (used by the backups API).
+ *                                file?" queries from the master (used by the backups API),
+ *                                and accepts deployment orders from it.
+ *  - {@link ReplicaDeployRunner} runs the replica's own deployment pipeline when ordered,
+ *                                streaming step status and logs back to the master.
  *  - {@link TrustedIpMiddleware} restricts the HTTP endpoints to allow-listed IPs.
  *
  * This module is also booted STANDALONE as the whole app when the node's role is
@@ -64,10 +70,14 @@ import { SignedServiceSerializer } from "src/auth/service-auth.util";
          },
       ]),
    ],
-   controllers: [ReplicationController],
+   // HealthController: the only unauthenticated route a replica exposes. The updater polls
+   // it after swapping the app container and rolls back if it does not come up healthy.
+   controllers: [ReplicationController, HealthController],
    providers: [
       ReplicationService,
       ReplicaLinkClient,
+      ReplicaDeployRunner,
+      ImageArtifactService,
       {
          provide: AbstractFileSystem,
          useClass: NodeFileSystemService,
@@ -88,6 +98,7 @@ import { SignedServiceSerializer } from "src/auth/service-auth.util";
       },
 
    ],
+   exports: [ImageArtifactService],
 })
 export class ReplicationModule implements NestModule {
    configure(consumer: MiddlewareConsumer) {

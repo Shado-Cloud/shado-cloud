@@ -5,6 +5,7 @@ import { SkipThrottle } from "@nestjs/throttler";
 import { ServiceKeyGuard } from "src/auth/service-key.guard";
 import { Request, Response } from "express";
 import { resolveClientIp } from "./client-ip.util";
+import { ImageArtifactService } from "./image-artifact.service";
 
 /**
  * HTTP endpoints the REPLICA pulls from (all master-served). Every route is
@@ -17,7 +18,10 @@ import { resolveClientIp } from "./client-ip.util";
 @ApiTags("Replication")
 @SkipThrottle()
 export class ReplicationController {
-   constructor(private readonly replicationService: ReplicationService) {}
+   constructor(
+      private readonly replicationService: ReplicationService,
+      private readonly imageArtifacts: ImageArtifactService,
+   ) {}
 
    /** Master: list every file in cloud-dir, and record the calling replica in the registry. */
    @Get("listall")
@@ -61,5 +65,22 @@ export class ReplicationController {
    @UseGuards(ServiceKeyGuard)
    public async getDatabase(@Res() res: Response) {
       return this.replicationService.getDatabaseDump(res);
+   }
+
+   /**
+    * Master: stream an encrypted container image the replica was told to deploy.
+    *
+    * Replicas are updated by image replacement rather than by building from source, and the
+    * images come from here instead of a registry — bandwidth is not the constraint, and this
+    * keeps the code off any third party and reuses an already-authenticated path.
+    *
+    * The artifact id is the tarball's content hash, which the replica received over the
+    * HMAC-authenticated replica-link and verifies before letting the archive near its Docker
+    * daemon. Same guard and IP allow-list as every other route here.
+    */
+   @Get("image/:artifact")
+   @UseGuards(ServiceKeyGuard)
+   public getImage(@Param("artifact") artifact: string, @Res() res: Response) {
+      this.imageArtifacts.stream(artifact, res);
    }
 }

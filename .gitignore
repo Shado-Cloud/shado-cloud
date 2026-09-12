@@ -56,3 +56,6 @@ shado_cloud_sqlite
 
 # Setup script venv
 setup-new-server-script/.venv/
+
+# Throwaway config written by the deployment pipeline during an image smoke test.
+.smoke-config.yml

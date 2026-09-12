@@ -1,10 +1,10 @@
 import { Inject, Logger } from "@nestjs/common";
-import { OnGatewayConnection, OnGatewayDisconnect, WebSocketGateway } from "@nestjs/websockets";
+import { ConnectedSocket, MessageBody, OnGatewayConnection, OnGatewayDisconnect, SubscribeMessage, WebSocketGateway } from "@nestjs/websockets";
 import type { Socket } from "socket.io";
 import { ConfigService } from "@nestjs/config";
 import { EnvVariables } from "src/config/config.validator";
 import { ReplicaLinkRegistry } from "./replica-link.registry";
-import { REPLICA_LINK_NAMESPACE } from "./replica-link.constants";
+import { DEPLOY_PROGRESS_EVENT, REPLICA_LINK_NAMESPACE, type ReplicaDeployProgress, type ReplicaLinkRole } from "./replica-link.constants";
 import { verifyServiceHmac } from "src/auth/service-auth.util";
 
 /**
@@ -12,6 +12,9 @@ import { verifyServiceHmac } from "src/auth/service-auth.util";
  * side, so NAT/tunnel is not a problem) and are tracked in ReplicaLinkRegistry. The
  * connection is authenticated with the shared cross-service secret; unauthenticated
  * sockets are dropped immediately.
+ *
+ * Two flows run over it: master-initiated queries/orders (has-file, deploy) and the
+ * replica-initiated progress stream that reports a deployment order's status and logs.
  *
  * On a replica node this gateway is still instantiated but simply never receives
  * connections (the replica isn't publicly reachable) — harmless.
@@ -48,10 +51,29 @@ export class ReplicationGateway implements OnGatewayConnection, OnGatewayDisconn
       const deviceName = typeof auth.deviceName === "string" && auth.deviceName.trim() ? auth.deviceName.trim() : "unknown";
       const mirrorDirs = Number.isFinite(Number(auth.mirrorDirs)) ? Number(auth.mirrorDirs) : 0;
 
-      this.registry.register(client, ip, deviceName, mirrorDirs);
+      // Two clients per replica host share this namespace: the app (file queries) and the
+      // updater (deployments). Deploy orders are routed by this, so an unrecognised value must
+      // fall back to "app" rather than be trusted blindly.
+      const role: ReplicaLinkRole = auth.role === "updater" ? "updater" : "app";
+
+      this.registry.register(client, ip, deviceName, mirrorDirs, role);
    }
 
    handleDisconnect(client: Socket): void {
       this.registry.unregister(client.id);
+   }
+
+   /**
+    * Progress frames from a replica that is running a deployment order. Only sockets already
+    * in the registry are trusted — an unregistered socket never passed the HMAC handshake, so
+    * the registry drops its frames.
+    */
+   @SubscribeMessage(DEPLOY_PROGRESS_EVENT)
+   handleDeployProgress(@ConnectedSocket() client: Socket, @MessageBody() progress: ReplicaDeployProgress): void {
+      if (!progress || typeof progress.runId !== "string" || typeof progress.phase !== "string") {
+         this.logger.debug(`Dropping malformed deploy progress frame from socket ${client.id}`);
+         return;
+      }
+      this.registry.handleDeployProgress(client.id, progress);
    }
 }

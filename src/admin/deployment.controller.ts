@@ -156,6 +156,12 @@ export class DeploymentController {
       return { success: true };
    }
 
+   @Get("deployment/replicas")
+   @UseGuards(JwtAuthGuard, AdminGuard)
+   public getConnectedReplicas() {
+      return this.deploymentService.connectedReplicas();
+   }
+
    @Get("deployment/status")
    @UseGuards(JwtAuthGuard, AdminGuard)
    public async getDeploymentStatus() {
@@ -207,7 +213,7 @@ export class DeploymentController {
       const project = await this.deploymentService.getProject(projectSlug);
       if (!project) throw new HttpException("Project not found", HttpStatus.NOT_FOUND);
 
-      const workDir = project.workDir === "__CWD__" ? process.cwd() : project.workDir;
+      const workDir = this.deploymentService.resolveWorkDir(project);
       const envPath = path.join(workDir, ".env");
 
       if (this.abstractFs.existsSync(envPath)) {
@@ -231,7 +237,7 @@ export class DeploymentController {
       const project = await this.deploymentService.getProject(projectSlug);
       if (!project) throw new HttpException("Project not found", HttpStatus.NOT_FOUND);
 
-      const workDir = project.workDir === "__CWD__" ? process.cwd() : project.workDir;
+      const workDir = this.deploymentService.resolveWorkDir(project);
 
       if (!workDir) {
          throw new HttpException("Working directory not configured", HttpStatus.BAD_REQUEST);

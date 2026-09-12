@@ -7,18 +7,27 @@ import { EnvVariables, ReplicationRole } from "src/config/config.validator";
 import { AbstractFileSystem } from "src/file-system/abstract-file-system.interface";
 import { signServiceHeaders } from "src/auth/service-auth.util";
 import {
+   DEPLOY_EVENT,
+   DEPLOY_PROGRESS_EVENT,
    HAS_FILE_EVENT,
    REPLICA_LINK_NAMESPACE,
    type HasFileReply,
    type HasFileRequest,
+   type ReplicaDeployAck,
+   type ReplicaDeployProgress,
+   type ReplicaDeployRequest,
    type ReplicaMirrorReport,
 } from "./replica-link.constants";
+import { ReplicaDeployRunner } from "./replica-deploy.runner";
 
 /**
  * Replica-side endpoint of the replica-link. Only active when this node's replication
  * role is Replica. Dials out to the master (which is publicly reachable) and answers
  * live "do you have this file?" queries by checking its own cloud-dir and configured
  * mirror disks. Socket.IO handles reconnection automatically.
+ *
+ * It also accepts deployment orders from the master and streams the resulting step status
+ * and log output back over the same socket (see {@link ReplicaDeployRunner}).
  */
 @Injectable()
 export class ReplicaLinkClient implements OnModuleInit, OnModuleDestroy {
@@ -28,6 +37,7 @@ export class ReplicaLinkClient implements OnModuleInit, OnModuleDestroy {
    constructor(
       private readonly config: ConfigService<EnvVariables>,
       @Inject() private readonly fs: AbstractFileSystem,
+      @Inject() private readonly deployRunner: ReplicaDeployRunner,
    ) {}
 
    onModuleInit(): void {
@@ -57,7 +67,10 @@ export class ReplicaLinkClient implements OnModuleInit, OnModuleDestroy {
          auth: (cb: (data: Record<string, unknown>) => void) => {
             const headers = signServiceHeaders(secret) as Record<string, string>;
             delete headers["x-service-key"];
-            cb({ ...headers, deviceName: os.hostname(), mirrorDirs });
+            // role: "app" — this client answers file queries. The separate updater container
+            // declares "updater" and receives the deployment orders, because the app container
+            // is the thing being replaced and cannot report on its own replacement.
+            cb({ ...headers, deviceName: os.hostname(), mirrorDirs, role: "app" });
          },
       });
 
@@ -68,6 +81,22 @@ export class ReplicaLinkClient implements OnModuleInit, OnModuleDestroy {
       // Master asks whether we currently have a file; reply with a live filesystem check.
       this.socket.on(HAS_FILE_EVENT, (req: HasFileRequest, ack?: (reply: HasFileReply) => void) => {
          const reply = this.checkFile(req?.path ?? "");
+         if (typeof ack === "function") ack(reply);
+      });
+
+      // Master orders us to deploy. The order carries no commands — we run OUR pipeline and
+      // stream progress back over the same socket.
+      this.socket.on(DEPLOY_EVENT, (req: ReplicaDeployRequest, ack?: (reply: ReplicaDeployAck) => void) => {
+         let reply: ReplicaDeployAck;
+         try {
+            reply = this.deployRunner.accept(req, (progress: ReplicaDeployProgress) => {
+               this.socket?.emit(DEPLOY_PROGRESS_EVENT, progress);
+            });
+         } catch (e) {
+            this.logger.error(`Failed to accept deployment order: ${(e as Error).message}`);
+            reply = { accepted: false, reason: (e as Error).message };
+         }
+         if (!reply.accepted) this.logger.warn(`Refused deployment order ${req?.runId}: ${reply.reason}`);
          if (typeof ack === "function") ack(reply);
       });
    }

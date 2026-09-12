@@ -7,6 +7,8 @@ import { FeatureFlagService } from "src/admin/feature-flag.service";
 import { REDIS_CACHE } from "src/util";
 import { getRepositoryToken } from "@nestjs/typeorm";
 import { DeploymentProject } from "src/models/admin/deploymentProject";
+import { ReplicaPropagationService } from "src/admin/replica-propagation.service";
+import { ImageBuildService } from "src/admin/image-build.service";
 import * as childProcess from "child_process";
 import { EventEmitter } from "events";
 
@@ -43,6 +45,16 @@ const backendSteps = [
    { step: "verify", name: "Verify Deployment", cmd: "pm2", args: ["jlist"], runsOnModuleInit: true },
 ];
 
+const propagateSteps = [
+   { step: "build", name: "Build", cmd: "npm", args: ["run", "build"] },
+   { step: "propagate_replicas", name: "Propagate to Replicas", cmd: "", args: [], propagateToReplicas: true },
+];
+
+const strictPropagateSteps = [
+   { step: "build", name: "Build", cmd: "npm", args: ["run", "build"] },
+   { step: "propagate_replicas", name: "Propagate to Replicas", cmd: "", args: [], propagateToReplicas: true, requireAllReplicas: true },
+];
+
 function makeProject(slug: string, steps: any[], workDir = "__CWD__"): DeploymentProject {
    const p = new DeploymentProject();
    p.id = 1;
@@ -62,10 +74,41 @@ describe("DeploymentService", () => {
    let featureFlagService: FeatureFlagService;
    let logger: AppLogger;
    const redisStore: Record<string, string> = {};
+   const queueStore: Record<string, string[]> = {};
    let projectRepo: any;
+   let replicaPropagation: any;
+   let imageBuilder: any;
 
    beforeEach(async () => {
       Object.keys(redisStore).forEach(k => delete redisStore[k]);
+      Object.keys(queueStore).forEach(k => delete queueStore[k]);
+
+      // Docker is available and every stage succeeds by default; individual tests override.
+      imageBuilder = {
+         isDockerAvailable: jest.fn().mockResolvedValue(true),
+         cloneSource: jest.fn().mockResolvedValue({ dir: "/tmp/shado-build-xyz", dispose: jest.fn() }),
+         build: jest.fn().mockResolvedValue("sha256:builtimage"),
+         smokeTest: jest.fn().mockResolvedValue(undefined),
+         stage: jest.fn().mockResolvedValue({
+            artifact: "a".repeat(32),
+            imageId: "sha256:builtimage",
+            tarSha256: "a".repeat(64),
+            size: 2 * 1024 * 1024 * 1024,
+         }),
+      };
+
+      // No replicas connected by default: propagation is a no-op pass-through.
+      replicaPropagation = {
+         connectedReplicas: jest.fn().mockReturnValue([]),
+         propagate: jest.fn().mockImplementation(async (opts: any, cb: any) => {
+            const state = { runId: `${opts.deploymentId}_prop_1`, dispatchedAt: 1, finishedAt: 2, replicas: [] as any[] };
+            cb.onLog("No replicas are connected to the replica-link — nothing to propagate to.\n");
+            cb.onDispatch(state);
+            return state;
+         }),
+         allSucceeded: jest.fn().mockReturnValue(true),
+         summarize: jest.fn().mockReturnValue("No replicas online"),
+      };
 
       projectRepo = {
          find: jest.fn().mockResolvedValue([makeProject("backend", backendSteps)]),
@@ -76,6 +119,8 @@ describe("DeploymentService", () => {
                { step: "npm_install", name: "NPM Install", cmd: "npm", args: ["install"] },
                { step: "build", name: "Build", cmd: "npm", args: ["run", "build"] },
             ], "/tmp/frontend"));
+            if (slug === "propagating") return Promise.resolve(makeProject("propagating", propagateSteps));
+            if (slug === "strict-propagating") return Promise.resolve(makeProject("strict-propagating", strictPropagateSteps));
             return Promise.resolve(null);
          }),
          create: jest.fn((data: any) => data),
@@ -109,11 +154,24 @@ describe("DeploymentService", () => {
                useValue: { isFeatureFlagDisabled: jest.fn().mockResolvedValue(false), isFeatureFlagEnabled: jest.fn().mockResolvedValue(true) },
             },
             {
+               provide: ReplicaPropagationService,
+               useValue: replicaPropagation,
+            },
+            {
+               provide: ImageBuildService,
+               useValue: imageBuilder,
+            },
+            {
                provide: REDIS_CACHE,
                useValue: {
                   get: jest.fn((key: string) => Promise.resolve(redisStore[key] || null)),
                   set: jest.fn((key: string, value: string) => { redisStore[key] = value; return Promise.resolve("OK"); }),
                   del: jest.fn((key: string) => { delete redisStore[key]; return Promise.resolve(1); }),
+                  // The deployment queue. Needed by any test that lets a pipeline reach a
+                  // terminal state, because both outcomes call processQueue().
+                  rpush: jest.fn((key: string, value: string) => { (queueStore[key] ??= []).push(value); return Promise.resolve(queueStore[key].length); }),
+                  lpop: jest.fn((key: string) => Promise.resolve(queueStore[key]?.shift() ?? null)),
+                  lrange: jest.fn((key: string) => Promise.resolve([...(queueStore[key] ?? [])])),
                },
             },
             {
@@ -279,6 +337,331 @@ describe("DeploymentService", () => {
          const outputEvents = events.filter((e) => e.type === "step_output");
          expect(outputEvents.length).toBeGreaterThan(0);
          expect(outputEvents.some((e) => e.output === "test output")).toBe(true);
+      });
+   });
+
+   describe("propagate to replicas step", () => {
+      /** Runs `propagating`/`strict-propagating` up to and through the propagation step. */
+      async function runToPropagation(slug: string) {
+         const mockProc = new EventEmitter() as any;
+         mockProc.stdout = new EventEmitter();
+         mockProc.stderr = new EventEmitter();
+         mockSpawnWithPwd(mockProc);
+
+         const subject = await service.startDeployment(slug, "admin");
+         const events: any[] = [];
+         subject.subscribe((event) => events.push(JSON.parse((event as any).data)));
+
+         await new Promise((r) => setTimeout(r, 50));
+         mockProc.emit("close", 0); // finish the "build" step
+         await new Promise((r) => setTimeout(r, 80));
+
+         return events;
+      }
+
+      it("runs the propagation service instead of spawning a command", async () => {
+         const events = await runToPropagation("propagating");
+
+         expect(replicaPropagation.propagate).toHaveBeenCalledTimes(1);
+         const [opts] = replicaPropagation.propagate.mock.calls[0];
+         expect(opts.project).toBe("propagating");
+         expect(opts.branch).toBe("master");
+         expect(opts.triggeredBy).toBe("admin");
+
+         // The step must not have been executed as a shell command.
+         const spawnedCmds = (childProcess.spawn as jest.Mock).mock.calls.map((c) => c[0]);
+         expect(spawnedCmds).not.toContain("");
+
+         expect(events.some((e) => e.type === "step_start" && e.step === "propagate_replicas")).toBe(true);
+         expect(events.some((e) => e.type === "replica_dispatch" && e.step === "propagate_replicas")).toBe(true);
+         expect(events.some((e) => e.type === "replica_done" && e.step === "propagate_replicas")).toBe(true);
+      });
+
+      it("succeeds and finishes the deployment when no replicas are connected", async () => {
+         await runToPropagation("propagating");
+
+         const deployment = await service.getCurrentDeployment();
+         expect(deployment?.status).toBe("success");
+         expect(deployment?.completedSteps["propagate_replicas"].status).toBe("success");
+      });
+
+      it("persists the propagation snapshot on the step so a reload can render it", async () => {
+         await runToPropagation("propagating");
+
+         const deployment = await service.getCurrentDeployment();
+         const propagation = deployment?.completedSteps["propagate_replicas"].propagation;
+         expect(propagation).toBeDefined();
+         expect(propagation?.replicas).toEqual([]);
+      });
+
+      it("does not fail the pipeline on replica failures by default", async () => {
+         replicaPropagation.allSucceeded.mockReturnValue(false);
+         replicaPropagation.summarize.mockReturnValue("1/2 replicas deployed");
+
+         await runToPropagation("propagating");
+
+         const deployment = await service.getCurrentDeployment();
+         expect(deployment?.status).toBe("success");
+         expect(deployment?.completedSteps["propagate_replicas"].status).toBe("success");
+      });
+
+      it("fails the pipeline on replica failures when requireAllReplicas is set", async () => {
+         replicaPropagation.allSucceeded.mockReturnValue(false);
+         replicaPropagation.summarize.mockReturnValue("1/2 replicas deployed");
+
+         const events = await runToPropagation("strict-propagating");
+
+         const deployment = await service.getCurrentDeployment();
+         expect(deployment?.status).toBe("failed");
+         expect(deployment?.completedSteps["propagate_replicas"].status).toBe("failed");
+         expect(deployment?.currentStep.error).toContain("1/2 replicas deployed");
+
+         expect(events.some((e) => e.type === "step_complete" && e.step === "propagate_replicas" && e.status === "failed")).toBe(true);
+         expect(emailService.sendEmail).toHaveBeenCalledWith(
+            expect.objectContaining({ subject: "Shado Cloud - strict-propagating deployment FAILED" }),
+         );
+      });
+
+      it("streams replica status and log deltas through the SSE stream", async () => {
+         replicaPropagation.propagate.mockImplementation(async (opts: any, cb: any) => {
+            const replica = {
+               id: "sock1",
+               deviceName: "replica-box",
+               ip: "1.2.3.4",
+               status: "running",
+               steps: [{ step: "git_pull", name: "Git Pull", status: "running" }],
+               output: "",
+            };
+            const state: any = { runId: "run1", dispatchedAt: 1, replicas: [replica] };
+            cb.onDispatch(state);
+            cb.onReplicaUpdate(replica);
+            cb.onReplicaOutput("sock1", "Already up to date.\n");
+            replica.status = "success";
+            cb.onReplicaUpdate(replica);
+            state.finishedAt = 2;
+            return state;
+         });
+
+         const events = await runToPropagation("propagating");
+
+         const updates = events.filter((e) => e.type === "replica_update");
+         expect(updates.length).toBe(2);
+         expect(updates[0].replica.deviceName).toBe("replica-box");
+
+         const outputs = events.filter((e) => e.type === "replica_output");
+         expect(outputs.length).toBe(1);
+         expect(outputs[0]).toMatchObject({ replicaId: "sock1", output: "Already up to date.\n" });
+
+         const done = events.find((e) => e.type === "replica_done");
+         expect(done.propagation.replicas[0].status).toBe("success");
+      });
+   });
+
+   describe("build replica image step", () => {
+      const imageSteps = [
+         { step: "build", name: "Build", cmd: "npm", args: ["run", "build"] },
+         {
+            step: "build_image",
+            name: "Build Replica Image",
+            cmd: "",
+            args: [],
+            buildImage: true,
+            dockerfile: "../Dockerfile.shado-cloud",
+            imageTarget: "runtime",
+            imageTag: "shado-cloud:deploy",
+            imageService: "shado-cloud",
+            smokePort: 9000,
+         },
+         { step: "propagate_replicas", name: "Propagate to Replicas", cmd: "", args: [], propagateToReplicas: true },
+      ];
+
+      beforeEach(() => {
+         projectRepo.findOneBy.mockImplementation(({ slug }: any) =>
+            Promise.resolve(slug === "imaged" ? makeProject("imaged", imageSteps) : null),
+         );
+      });
+
+      /** Runs the `imaged` project through its build step and on into propagation. */
+      async function runToBuild() {
+         const mockProc = new EventEmitter() as any;
+         mockProc.stdout = new EventEmitter();
+         mockProc.stderr = new EventEmitter();
+         mockSpawnWithPwd(mockProc);
+
+         const subject = await service.startDeployment("imaged", "admin");
+         const events: any[] = [];
+         subject.subscribe((event) => events.push(JSON.parse((event as any).data)));
+
+         await new Promise((r) => setTimeout(r, 50));
+         mockProc.emit("close", 0); // finish the npm build step
+         await new Promise((r) => setTimeout(r, 120));
+
+         return events;
+      }
+
+      it("builds, smoke-tests and stages the image, without spawning a command", async () => {
+         await runToBuild();
+
+         expect(imageBuilder.build).toHaveBeenCalledTimes(1);
+         const [buildOpts] = imageBuilder.build.mock.calls[0];
+         expect(buildOpts).toMatchObject({
+            dockerfile: "../Dockerfile.shado-cloud",
+            target: "runtime",
+            tag: "shado-cloud:deploy",
+         });
+
+         expect(imageBuilder.smokeTest).toHaveBeenCalledTimes(1);
+         expect(imageBuilder.smokeTest.mock.calls[0][0]).toMatchObject({ imageId: "sha256:builtimage", port: 9000 });
+         expect(imageBuilder.stage).toHaveBeenCalledWith("sha256:builtimage", expect.any(Function));
+      });
+
+      it("hands the staged image to the propagation step", async () => {
+         await runToBuild();
+
+         const [propagateOpts] = replicaPropagation.propagate.mock.calls[0];
+         expect(propagateOpts.images).toEqual([
+            {
+               service: "shado-cloud",
+               imageId: "sha256:builtimage",
+               tarSha256: "a".repeat(64),
+               size: 2 * 1024 * 1024 * 1024,
+               artifact: "a".repeat(32),
+            },
+         ]);
+      });
+
+      it("fails the deployment when the smoke test rejects the image, and never propagates", async () => {
+         imageBuilder.smokeTest.mockRejectedValue(new Error("Image did not become healthy within 90s (HTTP 502)"));
+
+         const events = await runToBuild();
+
+         const deployment = await service.getCurrentDeployment();
+         expect(deployment?.status).toBe("failed");
+         expect(deployment?.completedSteps["build_image"].status).toBe("failed");
+         expect(deployment?.currentStep.error).toContain("did not become healthy");
+
+         // The whole point of the smoke test: a bad image must not reach a replica.
+         expect(imageBuilder.stage).not.toHaveBeenCalled();
+         expect(replicaPropagation.propagate).not.toHaveBeenCalled();
+         expect(events.some((e) => e.type === "step_complete" && e.step === "build_image" && e.status === "failed")).toBe(true);
+      });
+
+      it("fails with an actionable message when Docker is missing on the host", async () => {
+         imageBuilder.build.mockRejectedValue(
+            new Error("Docker is not available on this host. Replica images are built here even though this node does not run containers"),
+         );
+
+         await runToBuild();
+
+         const deployment = await service.getCurrentDeployment();
+         expect(deployment?.status).toBe("failed");
+         expect(deployment?.currentStep.error).toContain("Docker is not available");
+         expect(replicaPropagation.propagate).not.toHaveBeenCalled();
+      });
+
+      it("can stage without smoke testing when the step opts out", async () => {
+         const noSmoke = imageSteps.map(s => (s.step === "build_image" ? { ...s, smokeTest: false } : s));
+         projectRepo.findOneBy.mockImplementation(({ slug }: any) =>
+            Promise.resolve(slug === "imaged" ? makeProject("imaged", noSmoke) : null),
+         );
+
+         await runToBuild();
+
+         expect(imageBuilder.smokeTest).not.toHaveBeenCalled();
+         expect(imageBuilder.stage).toHaveBeenCalledTimes(1);
+      });
+
+      it("builds from the primary's own working directory when no sourceRepo is set", async () => {
+         await runToBuild();
+
+         expect(imageBuilder.cloneSource).not.toHaveBeenCalled();
+         // makeProject uses workDir "__CWD__", which resolveWorkDir expands to process.cwd().
+         expect(imageBuilder.build.mock.calls[0][0].workDir).toBe(process.cwd());
+      });
+
+      describe("building from a fresh clone", () => {
+         const clonedSteps = imageSteps.map(s =>
+            s.step === "build_image"
+               ? {
+                    ...s,
+                    sourceRepo: "https://github.com/Shado-Cloud/Shado-Cloud-Services.git",
+                    sourceBranch: "main",
+                    contextSubdir: "shado-cloud",
+                 }
+               : s,
+         );
+         let dispose: jest.Mock;
+
+         beforeEach(() => {
+            dispose = jest.fn();
+            imageBuilder.cloneSource.mockResolvedValue({ dir: "/tmp/shado-build-xyz", dispose });
+            projectRepo.findOneBy.mockImplementation(({ slug }: any) =>
+               Promise.resolve(slug === "imaged" ? makeProject("imaged", clonedSteps) : null),
+            );
+         });
+
+         it("clones the configured repo and builds from the given subdirectory", async () => {
+            await runToBuild();
+
+            expect(imageBuilder.cloneSource).toHaveBeenCalledWith(
+               "https://github.com/Shado-Cloud/Shado-Cloud-Services.git",
+               "main",
+               expect.any(Function),
+            );
+            // Context is the subdirectory of the clone, NOT the primary's own checkout — that is
+            // the whole point: the image must not pick up this host's config.yml or node_modules.
+            expect(imageBuilder.build.mock.calls[0][0].workDir).toBe("/tmp/shado-build-xyz/shado-cloud");
+            expect(imageBuilder.smokeTest.mock.calls[0][0].workDir).toBe("/tmp/shado-build-xyz/shado-cloud");
+         });
+
+         it("deletes the clone after a successful build", async () => {
+            await runToBuild();
+            expect(dispose).toHaveBeenCalledTimes(1);
+         });
+
+         it("deletes the clone even when the build fails", async () => {
+            imageBuilder.build.mockRejectedValue(new Error("docker build exited with code 1"));
+
+            await runToBuild();
+
+            // Otherwise a few hundred MB would accumulate in the temp dir on every failed deploy.
+            expect(dispose).toHaveBeenCalledTimes(1);
+            expect((await service.getCurrentDeployment())?.status).toBe("failed");
+         });
+
+         it("deletes the clone even when the smoke test rejects the image", async () => {
+            imageBuilder.smokeTest.mockRejectedValue(new Error("Image did not become healthy"));
+
+            await runToBuild();
+
+            expect(dispose).toHaveBeenCalledTimes(1);
+            expect(imageBuilder.stage).not.toHaveBeenCalled();
+         });
+
+         it("falls back to the project's branch when sourceBranch is unset", async () => {
+            const noBranch = clonedSteps.map(s => (s.step === "build_image" ? { ...s, sourceBranch: undefined } : s));
+            projectRepo.findOneBy.mockImplementation(({ slug }: any) =>
+               Promise.resolve(slug === "imaged" ? makeProject("imaged", noBranch) : null),
+            );
+
+            await runToBuild();
+
+            // makeProject sets branch "master".
+            expect(imageBuilder.cloneSource).toHaveBeenCalledWith(expect.any(String), "master", expect.any(Function));
+         });
+
+         it("fails the step, without building, when the clone fails", async () => {
+            imageBuilder.cloneSource.mockRejectedValue(
+               new Error("Could not clone https://github.com/Shado-Cloud/Shado-Cloud-Services.git (main): authentication failed"),
+            );
+
+            await runToBuild();
+
+            expect(imageBuilder.build).not.toHaveBeenCalled();
+            const deployment = await service.getCurrentDeployment();
+            expect(deployment?.status).toBe("failed");
+            expect(deployment?.currentStep.error).toContain("Could not clone");
+         });
       });
    });
 

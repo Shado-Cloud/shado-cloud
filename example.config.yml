@@ -28,7 +28,7 @@ this-service:
     # (the hourly DB dump/restore cycle); only files will be mirrored. Defaults to
     # true (databases are replicated) when omitted.
     replicate-database: true
-  
+
   # CORS allowed origin(s). Supports a comma-separated list; each entry is trimmed,
   # e.g. "http://localhost:3000,https://localhost" (https://localhost is the Android
   # native WebView origin; capacitor://localhost for iOS is already allowed).

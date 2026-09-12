@@ -1,6 +1,7 @@
 import { Global, type MiddlewareConsumer, Module, RequestMethod, Scope } from "@nestjs/common";
 import { TypeOrmModule } from "@nestjs/typeorm";
 import { AppController } from "./app.controller";
+import { HealthController } from "./health/health.controller";
 import { AppService } from "./app.service";
 import { AuthModule } from "./auth/auth.module";
 import { FilesModule } from "./files/files.module";
@@ -152,7 +153,7 @@ export class GlobalUtilityModule { }
       GoogleBackupModule,
       ScheduleModule.forRoot(),
    ],
-   controllers: [AppController],
+   controllers: [AppController, HealthController],
    providers: [
       AppService,
       {
