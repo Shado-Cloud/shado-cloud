@@ -18,6 +18,7 @@ import {
 } from "@nestjs/common";
 import { JwtAuthGuard } from "src/auth/auth.guard";
 import { FileInterceptor } from "@nestjs/platform-express";
+import { Throttle } from "@nestjs/throttler";
 import { ApiConsumes, ApiOperation, ApiParam, ApiProduces, ApiProperty, ApiResponse, ApiTags } from "@nestjs/swagger";
 import { Request, Response } from "express";
 import { pipeline } from "stream";
@@ -226,6 +227,15 @@ export class FilesConstoller {
 
    @Get("thumbnail/:path")
    @UseInterceptors(ThumbnailCacheInterceptor)
+   // Thumbnails are read-only, cache-friendly image assets. A single view (a big play queue,
+   // a grid of playlists) legitimately fires dozens-to-hundreds of <img> requests at once, so
+   // the 1000/min global ceiling was tripping and returning 429 for artwork. Two request paths
+   // share the pain: playlist covers hit here directly (keyed on the user's real IP), while song
+   // covers are proxied by shado-music-api, which forwards no `cf-connecting-ip` — so ALL of its
+   // proxied thumbnail requests collapse onto the one music-api server IP and share a single
+   // bucket. Both need a much higher ceiling than a normal API route; this stays a ceiling
+   // (blocks pathological scraping) without throttling ordinary browsing.
+   @Throttle({ default: { ttl: 60_000, limit: 6000 } })
    @ApiResponse({
       description: "Returns a thumnail stream of the requested file",
    })
