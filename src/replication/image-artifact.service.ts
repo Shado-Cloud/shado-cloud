@@ -5,6 +5,8 @@ import { createCipheriv, createHash, randomBytes } from "crypto";
 import type { Response } from "express";
 import * as os from "os";
 import * as path from "path";
+import { Transform } from "stream";
+import { pipeline } from "stream/promises";
 import { AbstractFileSystem } from "src/file-system/abstract-file-system.interface";
 import { EnvVariables } from "src/config/config.validator";
 
@@ -22,6 +24,17 @@ export interface ImageArtifact {
 /** Artifacts older than this are pruned; a deploy only needs them for minutes. */
 const ARTIFACT_TTL_MS = 6 * 60 * 60 * 1000;
 const ARTIFACT_PREFIX = "shado-image-";
+
+function humanSize(bytes: number): string {
+   const units = ["B", "KB", "MB", "GB"];
+   let v = bytes;
+   let i = 0;
+   while (v >= 1024 && i < units.length - 1) {
+      v /= 1024;
+      i++;
+   }
+   return `${v.toFixed(1)}${units[i]}`;
+}
 
 /**
  * Master-side store of exported container images, and the endpoint body that streams them to
@@ -61,29 +74,62 @@ export class ImageArtifactService {
 
       const hash = createHash("sha256");
       let size = 0;
+      let lastReport = Date.now();
 
-      await new Promise<void>((resolve, reject) => {
-         const proc = spawn("docker", ["save", imageId], { stdio: ["ignore", "pipe", "pipe"] });
-         const out = this.fs.createWriteStream(tmpFile);
-         let stderr = "";
+      const proc = spawn("docker", ["save", imageId], { stdio: ["ignore", "pipe", "pipe"] });
+      let stderr = "";
+      proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
 
-         proc.stdout.on("data", (chunk: Buffer) => {
+      /**
+       * Hash in a Transform rather than a `data` listener on the child's stdout.
+       *
+       * A `data` listener puts the stream in flowing mode, which bypasses the pipe's backpressure:
+       * bytes get pushed at `docker save`'s pace regardless of how fast the disk accepts them, so
+       * a multi-gigabyte image accumulates in the write stream's buffer in memory. As part of the
+       * pipeline it stays backpressured.
+       *
+       * Progress is reported as it goes because this is gigabytes and takes minutes — without it
+       * the step looks hung.
+       */
+      const meter = new Transform({
+         transform(chunk: Buffer, _enc, cb) {
             hash.update(chunk);
             size += chunk.length;
-         });
-         proc.stdout.pipe(out);
-         proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-
-         proc.on("error", reject);
-         proc.on("close", (code) => {
-            if (code !== 0) {
-               reject(new Error(`docker save exited with code ${code}: ${stderr.trim()}`));
-               return;
+            if (Date.now() - lastReport > 5000) {
+               lastReport = Date.now();
+               onLog?.(`  exported ${humanSize(size)}...\n`);
             }
-            out.on("finish", () => resolve());
-            out.end();
-         });
+            cb(null, chunk);
+         },
       });
+
+      try {
+         // pipeline() propagates errors from every stage and destroys the rest on failure, so a
+         // disk-full or permission error surfaces instead of being swallowed by an unhandled
+         // 'error' event on the write stream. It also settles on the WRITE side finishing, rather
+         // than racing the child's exit against the stream flush.
+         await pipeline(proc.stdout, meter, this.fs.createWriteStream(tmpFile));
+      } catch (e) {
+         this.safeUnlink(tmpFile);
+         proc.kill("SIGKILL");
+         throw new Error(`Writing the image export failed: ${(e as Error).message}. Is there room for ${humanSize(size)}+ in ${os.tmpdir()}?`);
+      }
+
+      // The stream ending does not mean docker succeeded — a failure part-way still closes stdout,
+      // leaving a truncated tar. Check the exit status before trusting the bytes.
+      const code = await new Promise<number | null>((resolve, reject) => {
+         proc.on("error", reject);
+         if (proc.exitCode !== null) resolve(proc.exitCode);
+         else proc.on("close", resolve);
+      });
+      if (code !== 0) {
+         this.safeUnlink(tmpFile);
+         throw new Error(`docker save exited with code ${code}: ${stderr.trim() || "(no output)"}`);
+      }
+      if (size === 0) {
+         this.safeUnlink(tmpFile);
+         throw new Error(`docker save produced no output for ${imageId}`);
+      }
 
       const tarSha256 = hash.digest("hex");
       // The artifact id IS the content hash, so re-exporting an unchanged image is idempotent
@@ -99,8 +145,8 @@ export class ImageArtifactService {
          this.fs.renameSync(tmpFile, finalPath);
       }
 
-      onLog?.(`Exported ${this.humanSize(size)}, sha256 ${tarSha256.slice(0, 16)}… (artifact ${artifact})\n`);
-      this.logger.log(`Staged image artifact ${artifact} for ${imageId} (${this.humanSize(size)})`);
+      onLog?.(`Exported ${humanSize(size)}, sha256 ${tarSha256.slice(0, 16)}… (artifact ${artifact})\n`);
+      this.logger.log(`Staged image artifact ${artifact} for ${imageId} (${humanSize(size)})`);
 
       return { artifact, imageId, tarSha256, size };
    }
@@ -183,14 +229,4 @@ export class ImageArtifactService {
       return createHash("sha256").update(salt).digest();
    }
 
-   private humanSize(bytes: number): string {
-      const units = ["B", "KB", "MB", "GB"];
-      let v = bytes;
-      let i = 0;
-      while (v >= 1024 && i < units.length - 1) {
-         v /= 1024;
-         i++;
-      }
-      return `${v.toFixed(1)}${units[i]}`;
-   }
 }
