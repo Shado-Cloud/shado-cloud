@@ -679,16 +679,72 @@ export class ReplicationService implements OnModuleInit {
 
    // ─────────────────────────────────  Helpers  ─────────────────────────────────
 
+   /**
+    * Recursively list files under `path_`, relative to the cloud dir.
+    *
+    * Entries that cannot be stat'd are SKIPPED with a warning rather than aborting. readdir can
+    * legitimately report something stat cannot resolve: a broken symlink, a Windows junction or
+    * reparse point that does not translate into a Linux container, an entry removed between the
+    * listing and the stat, or a bind-mount filesystem returning DT_UNKNOWN so an entry is
+    * misclassified. Any one of those used to throw ENOENT out of the whole walk, which aborted the
+    * replication pass — so a single unreadable entry meant NOTHING replicated, and the log said
+    * only "no such file or directory".
+    *
+    * Symlinks are skipped deliberately: copying a link's target under the link's name would give
+    * the replica different content from the master, and following one out of the cloud dir would
+    * replicate files from outside it.
+    */
    private async listRecusively(path_: string) {
-      const entries = this.fs.readdirSync(path_);
+      const cloudDir = this.config.get("this-service.cloud-dir", { infer: true });
+      let entries: ReturnType<AbstractFileSystem["readdirSync"]>;
+      try {
+         entries = this.fs.readdirSync(path_);
+      } catch (e) {
+         this.logger.warn(`Skipping unreadable directory ${path_}: ${(e as Error).message}`);
+         return [];
+      }
 
-      // Get files within the current directory and add a path key to the file objects
-      const files = entries
-         .filter((file) => !file.isDirectory())
-         .map((file) => ({ ...file, path: path.relative(this.config.get("this-service.cloud-dir", { infer: true }), path_ + "/" + file.name), size: this.fs.statSync(path_ + "/" + file.name).size }));
+      const files: { name: string; path: string; size: number }[] = [];
+      const folders: typeof entries = [];
 
-      // Get folders within the current directory
-      const folders = entries.filter((folder) => folder.isDirectory());
+      for (const entry of entries) {
+         const full = path_ + "/" + entry.name;
+
+         // Classify by lstat rather than trusting the Dirent: some bind-mount filesystems report
+         // DT_UNKNOWN, which makes isDirectory() false for real directories.
+         let isDir = entry.isDirectory();
+         let isLink = entry.isSymbolicLink();
+         if (!isDir && !isLink) {
+            try {
+               const st = this.fs.lstatSync(full);
+               isDir = st.isDirectory();
+               isLink = st.isSymbolicLink();
+            } catch (e) {
+               this.logger.warn(`Skipping ${full}: ${(e as Error).message}`);
+               continue;
+            }
+         }
+
+         if (isLink) {
+            this.logger.warn(`Skipping symlink ${full} (replicating a link's target under its name would diverge from the master)`);
+            continue;
+         }
+         if (isDir) {
+            folders.push(entry);
+            continue;
+         }
+
+         try {
+            files.push({
+               ...entry,
+               name: entry.name,
+               path: path.relative(cloudDir, full),
+               size: this.fs.statSync(full).size,
+            });
+         } catch (e) {
+            this.logger.warn(`Skipping ${full}: ${(e as Error).message}`);
+         }
+      }
 
       /*
        * Add the found files within the subdirectory to the files array by calling the

@@ -101,3 +101,156 @@ describe("ReplicationService.checkStaleReplicas — alert de-duplication", () =>
       expect(redis.hgetall).not.toHaveBeenCalled();
    });
 });
+
+
+/**
+ * Regression tests for listing the cloud dir.
+ *
+ * A replica reported:
+ *
+ *   replica encountered an exception: no such file or directory, stat '/data/xxx@gmail.com'
+ *
+ * `listRecusively` stat'd every non-directory entry and let the error escape, so ONE entry that
+ * readdir listed but stat could not resolve aborted the whole walk — and with it the entire
+ * replication pass. Nothing replicated, and the log named only the missing path.
+ *
+ * readdir can legitimately report something stat cannot resolve: a broken symlink, a Windows
+ * junction or reparse point that does not translate into a Linux container, an entry removed
+ * between listing and stat, or a bind-mount filesystem returning DT_UNKNOWN so entries are
+ * misclassified. None of those should stop a replica syncing everything else.
+ */
+describe("ReplicationService.listCloudDir — unreadable entries", () => {
+   const CLOUD_DIR = "/data";
+
+   type Entry = { name: string; kind: "file" | "dir" | "link" | "unstattable" | "unknown-type-dir" };
+
+   /** Filesystem mock where each entry's behaviour under lstat/stat is chosen per test. */
+   function makeFs(tree: Record<string, Entry[]>) {
+      const dirent = (e: Entry) => ({
+         name: e.name,
+         isDirectory: () => e.kind === "dir",
+         isSymbolicLink: () => e.kind === "link",
+         isFile: () => e.kind === "file",
+      });
+      const find = (p: string): Entry | undefined => {
+         const parent = p.slice(0, p.lastIndexOf("/")) || "/";
+         const name = p.slice(p.lastIndexOf("/") + 1);
+         return (tree[parent] ?? []).find((e) => e.name === name);
+      };
+      const statish = (p: string) => {
+         const e = find(p);
+         if (!e || e.kind === "unstattable") {
+            throw Object.assign(new Error(`ENOENT: no such file or directory, stat '${p}'`), { code: "ENOENT" });
+         }
+         return {
+            isDirectory: () => e.kind === "dir" || e.kind === "unknown-type-dir",
+            isSymbolicLink: () => e.kind === "link",
+            isFile: () => e.kind === "file",
+            size: 100,
+         };
+      };
+      return {
+         readdirSync: jest.fn((p: string) => {
+            if (!(p in tree)) throw new Error(`EACCES: permission denied, scandir '${p}'`);
+            return (tree[p] ?? []).map(dirent);
+         }),
+         lstatSync: jest.fn(statish),
+         statSync: jest.fn(statish),
+      };
+   }
+
+   function build(tree: Record<string, Entry[]>) {
+      const fs = makeFs(tree);
+      const service = new ReplicationService(
+         { get: jest.fn().mockReturnValue(CLOUD_DIR) } as any,
+         fs as any,
+         {} as any,
+         {} as any,
+      );
+      return { service, fs };
+   }
+
+   it("skips an entry that cannot be stat'd and still returns the rest", async () => {
+      const { service } = build({
+         [CLOUD_DIR]: [
+            { name: "xxx@gmail.com", kind: "unstattable" },
+            { name: "readable.txt", kind: "file" },
+         ],
+      });
+
+      const files = await service.listCloudDir();
+
+      expect(files.map((f) => f.path)).toEqual(["readable.txt"]);
+   });
+
+   it("does not throw when EVERY entry is unreadable", async () => {
+      const { service } = build({ [CLOUD_DIR]: [{ name: "xxx@gmail.com", kind: "unstattable" }] });
+
+      await expect(service.listCloudDir()).resolves.toEqual([]);
+   });
+
+   it("still recurses into sibling directories past an unreadable entry", async () => {
+      const { service } = build({
+         [CLOUD_DIR]: [
+            { name: "broken", kind: "unstattable" },
+            { name: "user@example.com", kind: "dir" },
+         ],
+         [`${CLOUD_DIR}/user@example.com`]: [{ name: "doc.txt", kind: "file" }],
+      });
+
+      const files = await service.listCloudDir();
+
+      expect(files.map((f) => f.path)).toEqual(["user@example.com/doc.txt"]);
+   });
+
+   it("treats a directory as a directory even when readdir reports an unknown type", async () => {
+      // Some bind-mount filesystems return DT_UNKNOWN, making Dirent.isDirectory() false for real
+      // directories — which previously sent them down the file path and stat'd them as files.
+      const { service } = build({
+         [CLOUD_DIR]: [{ name: "user@example.com", kind: "unknown-type-dir" }],
+         [`${CLOUD_DIR}/user@example.com`]: [{ name: "doc.txt", kind: "file" }],
+      });
+
+      const files = await service.listCloudDir();
+
+      expect(files.map((f) => f.path)).toEqual(["user@example.com/doc.txt"]);
+   });
+
+   it("skips symlinks rather than replicating a link's target under the link's name", async () => {
+      const { service } = build({
+         [CLOUD_DIR]: [
+            { name: "elsewhere", kind: "link" },
+            { name: "real.txt", kind: "file" },
+         ],
+      });
+
+      const files = await service.listCloudDir();
+
+      expect(files.map((f) => f.path)).toEqual(["real.txt"]);
+   });
+
+   it("skips an unreadable directory instead of aborting the walk", async () => {
+      const { service } = build({
+         [CLOUD_DIR]: [
+            { name: "locked", kind: "dir" },
+            { name: "ok.txt", kind: "file" },
+         ],
+         // `locked` is deliberately absent from the tree, so readdir throws EACCES on it.
+      });
+
+      const files = await service.listCloudDir();
+
+      expect(files.map((f) => f.path)).toEqual(["ok.txt"]);
+   });
+
+   it("reports sizes and cloud-dir-relative paths", async () => {
+      const { service } = build({
+         [CLOUD_DIR]: [{ name: "a", kind: "dir" }],
+         [`${CLOUD_DIR}/a`]: [{ name: "b.txt", kind: "file" }],
+      });
+
+      const files = await service.listCloudDir();
+
+      expect(files).toEqual([expect.objectContaining({ path: "a/b.txt", size: 100 })]);
+   });
+});
