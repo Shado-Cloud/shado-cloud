@@ -334,11 +334,54 @@ describe("ReplicaPropagationService", () => {
          expect(logs.join("")).toContain("shado-cloud: sha256:new");
       });
 
-      it("counts only apps as connected replicas, not updaters", () => {
+      it("reports one host with both roles when app and updater share a machine", () => {
          harness.connect(replicaInfo("app1", "box", "10.0.0.1", "app"));
          harness.connect(replicaInfo("upd1", "box", "10.0.0.1", "updater"));
 
-         expect(service.connectedReplicas().map((r) => r.id)).toEqual(["app1"]);
+         const hosts = service.connectedReplicas();
+         expect(hosts).toHaveLength(1);
+         expect(hosts[0].deviceName).toBe("box");
+         expect(hosts[0].roles.sort()).toEqual(["app", "updater"]);
+      });
+
+      it("reports a freshly provisioned replica that has only an updater", () => {
+         // The case that presented as "no replicas online" while the operator's replica sat there
+         // connected: an image has not been delivered yet, so there is no app half.
+         harness.connect(replicaInfo("upd1", "fresh-box", "10.0.0.9", "updater"));
+
+         const hosts = service.connectedReplicas();
+         expect(hosts).toHaveLength(1);
+         expect(hosts[0].roles).toEqual(["updater"]);
+      });
+
+      it("keeps distinct hosts separate", () => {
+         harness.connect(replicaInfo("upd1", "box-a", "10.0.0.1", "updater"));
+         harness.connect(replicaInfo("upd2", "box-b", "10.0.0.2", "updater"));
+
+         expect(service.connectedReplicas().map((h) => h.deviceName).sort()).toEqual(["box-a", "box-b"]);
+      });
+
+      it("explains the mismatch when updaters are connected but the order carries no image", async () => {
+         const { cb, logs } = makeCallbacks();
+         harness.connect(replicaInfo("upd1", "box", "10.0.0.1", "updater"));
+
+         // No images => targets "app", of which there are none, while an updater waits.
+         await service.propagate(fastOpts, cb);
+
+         const text = logs.join("");
+         expect(text).toContain("1 replica updater(s) ARE connected: box");
+         expect(text).toContain("Add a \"Build Replica Image\" step BEFORE this one");
+      });
+
+      it("explains the mismatch when an image is sent but no updater is running", async () => {
+         const { cb, logs } = makeCallbacks();
+         harness.connect(replicaInfo("app1", "box", "10.0.0.1", "app"));
+
+         await service.propagate({ ...fastOpts, images: [image] }, cb);
+
+         const text = logs.join("");
+         expect(text).toContain("1 replica app(s) ARE connected: box");
+         expect(text).toContain("Provision them with the shado-replica package");
       });
    });
 

@@ -105,7 +105,16 @@ export interface PropagationOptions {
    images?: ReplicaImageRef[];
 }
 
-/** Per-replica log cap. The whole deployment state is JSON-serialized into Redis. */
+/** A replica host, aggregated across however many replica-link clients it has connected. */
+export interface ConnectedReplicaHost {
+   deviceName: string;
+   ip: string;
+   mirrorDirs: number;
+   /** Earliest connection among this host's clients. */
+   connectedAt: number;
+   /** Which halves are present. `["updater"]` means the app image has not arrived yet. */
+   roles: ReplicaLinkRole[];
+}
 const MAX_OUTPUT_CHARS = 64 * 1024;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_RESTART_GRACE_MS = 3 * 60 * 1000;
@@ -142,11 +151,33 @@ export class ReplicaPropagationService {
    constructor(private readonly registry: ReplicaLinkRegistry) {}
 
    /**
-    * Replica APPS currently connected. That is what "a replica is online" means to a caller —
-    * one per host. Updaters are tooling beside a replica, not nodes serving anything.
+    * Replica HOSTS currently connected, aggregated across their clients.
+    *
+    * Counting hosts rather than sockets, and including updater-only hosts, because a freshly
+    * provisioned replica has an updater connected and no app — it has not been sent an image yet.
+    * Reporting that as "no replicas online" is both wrong and impossible to diagnose from the UI:
+    * the operator sees nothing while their replica sits there connected and waiting.
     */
-   public connectedReplicas(): ReplicaLinkInfo[] {
-      return this.registry.list("app");
+   public connectedReplicas(): ConnectedReplicaHost[] {
+      const byHost = new Map<string, ConnectedReplicaHost>();
+      for (const client of this.registry.list("any")) {
+         const key = `${client.ip}|${client.deviceName}`;
+         const existing = byHost.get(key);
+         if (existing) {
+            if (!existing.roles.includes(client.role)) existing.roles.push(client.role);
+            existing.connectedAt = Math.min(existing.connectedAt, client.connectedAt);
+            existing.mirrorDirs = Math.max(existing.mirrorDirs, client.mirrorDirs);
+         } else {
+            byHost.set(key, {
+               deviceName: client.deviceName,
+               ip: client.ip,
+               mirrorDirs: client.mirrorDirs,
+               connectedAt: client.connectedAt,
+               roles: [client.role],
+            });
+         }
+      }
+      return [...byHost.values()];
    }
 
    /**
@@ -384,6 +415,32 @@ export class ReplicaPropagationService {
    }
 
    /**
+    * Say why the target role is empty when the OTHER role is connected.
+    *
+    * Both mismatches look identical from the UI — a step that spins and then reports "no replicas"
+    * — while the actual cause is a pipeline misconfiguration that is invisible from here. Worth
+    * spelling out rather than leaving an operator to infer it.
+    */
+   private explainEmptyTarget(targetRole: ReplicaLinkRole, cb: PropagationCallbacks): void {
+      const other: ReplicaLinkRole = targetRole === "app" ? "updater" : "app";
+      const others = this.registry.list(other);
+      if (others.length === 0) return;
+
+      cb.onLog(`\n  Note: ${others.length} replica ${other}(s) ARE connected: ${others.map((r) => r.deviceName).join(", ")}\n`);
+      if (targetRole === "app") {
+         cb.onLog(
+            "  This deployment carried no image, so it targets replicas that deploy themselves from source —\n" +
+            "  but these replicas are image-based. Add a \"Build Replica Image\" step BEFORE this one.\n",
+         );
+      } else {
+         cb.onLog(
+            "  This deployment carried an image, which is applied by a replica's updater —\n" +
+            "  but these replicas have no updater running. Provision them with the shado-replica package.\n",
+         );
+      }
+   }
+
+   /**
     * Resolve the set of replicas to deploy to, tolerating the reconnect window.
     *
     * When this step runs after the primary's own restart every replica-link socket was just
@@ -416,6 +473,7 @@ export class ReplicaPropagationService {
          const hardTimer = setTimeout(() => {
             if (targetCount() === 0) {
                cb.onLog(`Gave up waiting after ${Math.round(waitMs / 1000)}s — no replica ${targetRole} reconnected.\n`);
+               this.explainEmptyTarget(targetRole, cb);
             }
             finish();
          }, waitMs);
@@ -430,6 +488,7 @@ export class ReplicaPropagationService {
             armSettle();
          } else {
             cb.onLog(`No replica ${targetRole} online yet — waiting up to ${Math.round(waitMs / 1000)}s for it to (re)connect to the replica-link…\n`);
+            this.explainEmptyTarget(targetRole, cb);
          }
       });
    }

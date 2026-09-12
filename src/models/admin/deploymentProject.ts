@@ -12,13 +12,6 @@ export interface DeploymentStepConfig {
    /** If true, this step is permanently skipped during deployment */
    skip?: boolean;
    /**
-    * If true, this step ignores `cmd`/`args` entirely and instead orders every replica
-    * connected to the replica-link to deploy itself, streaming each replica's step status
-    * and log output back to the primary. Place it BEFORE any `triggersRestart` step so the
-    * primary is still alive to collect the results.
-    */
-   propagateToReplicas?: boolean;
-   /**
     * Propagation only. When true the step fails unless every replica deployed successfully.
     * Default (false) reports replica failures without failing the primary's pipeline.
     */
@@ -32,16 +25,25 @@ export interface DeploymentStepConfig {
     */
    propagateWaitForReplicasMs?: number;
    /**
-    * If true, this step ignores `cmd`/`args` and instead builds a container image, smoke-tests
-    * it, and stages it for replicas to download.
+    * If true, this step ignores `cmd`/`args` and instead orders every replica connected to the
+    * replica-link to update, streaming each one's status and log output back.
     *
-    * A later `propagateToReplicas` step then hands replicas the resulting image instead of
-    * ordering them to build from source. The primary itself does not run from the image, so
-    * the smoke test is what stops a broken build reaching a host you cannot reach.
+    * Unless `buildImage` is explicitly false, it first builds the container image replicas will
+    * run, smoke-tests it, and stages it — then hands that one image to every replica. Build and
+    * propagate are one step because they are one intent, and splitting them meant a pipeline
+    * could hold the propagation half with no build to feed it, which presents as a step that
+    * spins and then reports "no replicas".
+    */
+   propagateToReplicas?: boolean;
+   /**
+    * Propagation only. Build and stage an image before dispatching. Defaults to true.
+    *
+    * Set false to fall back to ordering replicas to deploy themselves from source, for a replica
+    * that has no updater container.
     */
    buildImage?: boolean;
    /**
-    * Build only. Git URL to clone into a temp directory and build from, deleted afterwards.
+    * Propagation only. Git URL to clone into a temp directory and build from, deleted afterwards.
     *
     * Preferred over building from the primary's live checkout: a fresh clone contains exactly
     * what is committed — no `config.yml` (which holds real secrets), no `node_modules`, no
@@ -52,32 +54,32 @@ export interface DeploymentStepConfig {
     * Omit to build from the project's own working directory instead.
     */
    sourceRepo?: string;
-   /** Build only. Branch to clone. Defaults to the project's `branch`. */
+   /** Propagation only. Branch to clone. Defaults to the project's `branch`. */
    sourceBranch?: string;
    /**
-    * Build only. Subdirectory of the clone to use as the build context, e.g. `shado-cloud` when
-    * cloning the services superproject. Omit to use the clone root.
+    * Propagation only. Subdirectory of the clone to use as the build context, e.g. `shado-cloud`
+    * when cloning the services superproject. Omit to use the clone root.
     */
    contextSubdir?: string;
-   /** Build only. Dockerfile path relative to the build context. */
+   /** Propagation only. Dockerfile path relative to the build context. */
    dockerfile?: string;
-   /** Build only. Multi-stage target. Defaults to `runtime`. */
+   /** Propagation only. Multi-stage target. Defaults to `runtime`. */
    imageTarget?: string;
-   /** Build only. Local tag for the built image. Defaults to `<slug>:deploy`. */
+   /** Propagation only. Local tag for the built image. Defaults to `<slug>:deploy`. */
    imageTag?: string;
    /**
-    * Build only. Compose service name the image belongs to on a replica — this is what the
+    * Propagation only. Compose service name the image belongs to on a replica — this is what the
     * replica's updater matches against to know which container to recreate.
     */
    imageService?: string;
    /**
-    * Build only. Absolute path to a config file mounted at /app/config.yml during the smoke
-    * test. Without one the image must be able to boot from its own defaults.
+    * Propagation only. Absolute path to a config file mounted at /app/config.yml during the smoke
+    * test. When omitted a throwaway placeholder is generated.
     */
    smokeConfigFile?: string;
-   /** Build only. Container port the smoke test probes /health on. Defaults to 9000. */
+   /** Propagation only. Container port the smoke test probes /health on. Defaults to 9000. */
    smokePort?: number;
-   /** Build only. Set false to stage the image without smoke-testing it first. */
+   /** Propagation only. Set false to stage the image without smoke-testing it first. */
    smokeTest?: boolean;
 }
 

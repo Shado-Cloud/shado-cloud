@@ -43,16 +43,36 @@ const backendSteps = [
    { step: "migrate", name: "Run Migrations", cmd: "npx", args: ["typeorm", "migration:run", "-d", "ormconfig.js"] },
    { step: "restart", name: "Restart Service", cmd: "pm2", args: ["restart", "shado-cloud-backend"], triggersRestart: true },
    { step: "verify", name: "Verify Deployment", cmd: "pm2", args: ["jlist"], runsOnModuleInit: true },
+   {
+      step: "propagate_replicas",
+      name: "Propagate to Replicas",
+      cmd: "",
+      args: [],
+      propagateToReplicas: true,
+      buildImage: true,
+      sourceRepo: "https://github.com/Shado-Cloud/Shado-Cloud-Services.git",
+      sourceBranch: "main",
+      contextSubdir: "shado-cloud",
+      dockerfile: "../Dockerfile.shado-cloud",
+      imageTarget: "runtime",
+      imageTag: "shado-cloud:deploy",
+      imageService: "shado-cloud",
+      smokePort: 9000,
+   },
 ];
 
+/** Redis hash key recording which default-step additions each project has received. */
+const REDIS_STEPS_VERSION_KEY = "deployment:seeded-steps-version";
+
+// buildImage: false — these exercise dispatch alone, without the build half.
 const propagateSteps = [
    { step: "build", name: "Build", cmd: "npm", args: ["run", "build"] },
-   { step: "propagate_replicas", name: "Propagate to Replicas", cmd: "", args: [], propagateToReplicas: true },
+   { step: "propagate_replicas", name: "Propagate to Replicas", cmd: "", args: [], propagateToReplicas: true, buildImage: false },
 ];
 
 const strictPropagateSteps = [
    { step: "build", name: "Build", cmd: "npm", args: ["run", "build"] },
-   { step: "propagate_replicas", name: "Propagate to Replicas", cmd: "", args: [], propagateToReplicas: true, requireAllReplicas: true },
+   { step: "propagate_replicas", name: "Propagate to Replicas", cmd: "", args: [], propagateToReplicas: true, buildImage: false, requireAllReplicas: true },
 ];
 
 function makeProject(slug: string, steps: any[], workDir = "__CWD__"): DeploymentProject {
@@ -75,6 +95,7 @@ describe("DeploymentService", () => {
    let logger: AppLogger;
    const redisStore: Record<string, string> = {};
    const queueStore: Record<string, string[]> = {};
+   const redisHashes: Record<string, Record<string, string>> = {};
    let projectRepo: any;
    let replicaPropagation: any;
    let imageBuilder: any;
@@ -82,6 +103,7 @@ describe("DeploymentService", () => {
    beforeEach(async () => {
       Object.keys(redisStore).forEach(k => delete redisStore[k]);
       Object.keys(queueStore).forEach(k => delete queueStore[k]);
+      Object.keys(redisHashes).forEach(k => delete redisHashes[k]);
 
       // Docker is available and every stage succeeds by default; individual tests override.
       imageBuilder = {
@@ -172,6 +194,12 @@ describe("DeploymentService", () => {
                   rpush: jest.fn((key: string, value: string) => { (queueStore[key] ??= []).push(value); return Promise.resolve(queueStore[key].length); }),
                   lpop: jest.fn((key: string) => Promise.resolve(queueStore[key]?.shift() ?? null)),
                   lrange: jest.fn((key: string) => Promise.resolve([...(queueStore[key] ?? [])])),
+                  // Records which default-step additions each project has already received.
+                  hget: jest.fn((key: string, field: string) => Promise.resolve(redisHashes[key]?.[field] ?? null)),
+                  hset: jest.fn((key: string, field: string, value: string) => {
+                     (redisHashes[key] ??= {})[field] = value;
+                     return Promise.resolve(1);
+                  }),
                },
             },
             {
@@ -461,10 +489,11 @@ describe("DeploymentService", () => {
       const imageSteps = [
          { step: "build", name: "Build", cmd: "npm", args: ["run", "build"] },
          {
-            step: "build_image",
-            name: "Build Replica Image",
+            step: "propagate_replicas",
+            name: "Propagate to Replicas",
             cmd: "",
             args: [],
+            propagateToReplicas: true,
             buildImage: true,
             dockerfile: "../Dockerfile.shado-cloud",
             imageTarget: "runtime",
@@ -472,7 +501,6 @@ describe("DeploymentService", () => {
             imageService: "shado-cloud",
             smokePort: 9000,
          },
-         { step: "propagate_replicas", name: "Propagate to Replicas", cmd: "", args: [], propagateToReplicas: true },
       ];
 
       beforeEach(() => {
@@ -537,13 +565,13 @@ describe("DeploymentService", () => {
 
          const deployment = await service.getCurrentDeployment();
          expect(deployment?.status).toBe("failed");
-         expect(deployment?.completedSteps["build_image"].status).toBe("failed");
+         expect(deployment?.completedSteps["propagate_replicas"].status).toBe("failed");
          expect(deployment?.currentStep.error).toContain("did not become healthy");
 
          // The whole point of the smoke test: a bad image must not reach a replica.
          expect(imageBuilder.stage).not.toHaveBeenCalled();
          expect(replicaPropagation.propagate).not.toHaveBeenCalled();
-         expect(events.some((e) => e.type === "step_complete" && e.step === "build_image" && e.status === "failed")).toBe(true);
+         expect(events.some((e) => e.type === "step_complete" && e.step === "propagate_replicas" && e.status === "failed")).toBe(true);
       });
 
       it("fails with an actionable message when Docker is missing on the host", async () => {
@@ -560,7 +588,7 @@ describe("DeploymentService", () => {
       });
 
       it("can stage without smoke testing when the step opts out", async () => {
-         const noSmoke = imageSteps.map(s => (s.step === "build_image" ? { ...s, smokeTest: false } : s));
+         const noSmoke = imageSteps.map(s => (s.step === "propagate_replicas" ? { ...s, smokeTest: false } : s));
          projectRepo.findOneBy.mockImplementation(({ slug }: any) =>
             Promise.resolve(slug === "imaged" ? makeProject("imaged", noSmoke) : null),
          );
@@ -581,7 +609,7 @@ describe("DeploymentService", () => {
 
       describe("building from a fresh clone", () => {
          const clonedSteps = imageSteps.map(s =>
-            s.step === "build_image"
+            s.step === "propagate_replicas"
                ? {
                     ...s,
                     sourceRepo: "https://github.com/Shado-Cloud/Shado-Cloud-Services.git",
@@ -639,7 +667,7 @@ describe("DeploymentService", () => {
          });
 
          it("falls back to the project's branch when sourceBranch is unset", async () => {
-            const noBranch = clonedSteps.map(s => (s.step === "build_image" ? { ...s, sourceBranch: undefined } : s));
+            const noBranch = clonedSteps.map(s => (s.step === "propagate_replicas" ? { ...s, sourceBranch: undefined } : s));
             projectRepo.findOneBy.mockImplementation(({ slug }: any) =>
                Promise.resolve(slug === "imaged" ? makeProject("imaged", noBranch) : null),
             );
@@ -662,6 +690,113 @@ describe("DeploymentService", () => {
             expect(deployment?.status).toBe("failed");
             expect(deployment?.currentStep.error).toContain("Could not clone");
          });
+      });
+   });
+
+   describe("default step reconciliation", () => {
+      /**
+       * seedDefaults used to only INSERT projects, so a step added to the defaults never reached an
+       * environment where the project already existed — and it could not be shipped by migration
+       * either, since migrations/*.ts is gitignored. That presented as a pipeline silently missing
+       * a step, which is how "Propagate to Replicas" ended up spinning with no image to send.
+       */
+      it("adds a missing default step to an existing project", async () => {
+         const bare = backendSteps.filter(s => s.step !== "propagate_replicas");
+         const stored = makeProject("backend", bare);
+         projectRepo.findOneBy.mockResolvedValue(stored);
+
+         await service.onModuleInit();
+
+         expect(projectRepo.save).toHaveBeenCalled();
+         const saved = projectRepo.save.mock.calls.at(-1)[0] as DeploymentProject;
+         expect(saved.getSteps().map(s => s.step)).toContain("propagate_replicas");
+      });
+
+      it("inserts it in the position the defaults give it", async () => {
+         const bare = backendSteps.filter(s => s.step !== "propagate_replicas");
+         projectRepo.findOneBy.mockResolvedValue(makeProject("backend", bare));
+
+         await service.onModuleInit();
+
+         const ids = (projectRepo.save.mock.calls.at(-1)[0] as DeploymentProject).getSteps().map(s => s.step);
+         // Last: replicas only update once this node has restarted and verified itself.
+         expect(ids.indexOf("propagate_replicas")).toBe(ids.length - 1);
+         expect(ids.indexOf("propagate_replicas")).toBeGreaterThan(ids.indexOf("verify"));
+      });
+
+      it("fills in build settings a bare propagation step is missing", async () => {
+         // The case that broke a real upgrade: an existing project already had propagate_replicas
+         // from before it could build, so adding steps alone would leave it trying to build with
+         // nothing configured.
+         const barePropagate = backendSteps.map(s =>
+            s.step === "propagate_replicas" ? { step: s.step, name: s.name, cmd: "", args: [], propagateToReplicas: true } : s,
+         );
+         projectRepo.findOneBy.mockResolvedValue(makeProject("backend", barePropagate));
+
+         await service.onModuleInit();
+
+         const step = (projectRepo.save.mock.calls.at(-1)[0] as DeploymentProject)
+            .getSteps().find(s => s.step === "propagate_replicas");
+         expect(step?.buildImage).toBe(true);
+         expect(step?.sourceRepo).toContain("Shado-Cloud-Services");
+         expect(step?.contextSubdir).toBe("shado-cloud");
+         expect(step?.dockerfile).toBe("../Dockerfile.shado-cloud");
+      });
+
+      it("does not overwrite a build setting the operator already chose", async () => {
+         const customised = backendSteps.map(s =>
+            s.step === "propagate_replicas" ? { ...s, imageTag: "mine:custom", buildImage: false } : s,
+         );
+         projectRepo.findOneBy.mockResolvedValue(makeProject("backend", customised));
+
+         await service.onModuleInit();
+
+         expect(projectRepo.save).not.toHaveBeenCalled();
+      });
+
+      it("preserves customised commands and skip flags on existing steps", async () => {
+         const customised = backendSteps
+            .filter(s => s.step !== "propagate_replicas")
+            .map(s => (s.step === "test" ? { ...s, skip: true, args: ["test", "--custom"] } : s));
+         projectRepo.findOneBy.mockResolvedValue(makeProject("backend", customised));
+
+         await service.onModuleInit();
+
+         const steps = (projectRepo.save.mock.calls.at(-1)[0] as DeploymentProject).getSteps();
+         const test = steps.find(s => s.step === "test");
+         expect(test?.skip).toBe(true);
+         expect(test?.args).toEqual(["test", "--custom"]);
+      });
+
+      it("does nothing when the project already has every default step", async () => {
+         projectRepo.findOneBy.mockResolvedValue(makeProject("backend", backendSteps));
+
+         await service.onModuleInit();
+
+         expect(projectRepo.save).not.toHaveBeenCalled();
+      });
+
+      it("does not re-add a step the operator deleted after reconciliation ran", async () => {
+         // Recorded at or beyond the current version, so a deliberate deletion stays deleted
+         // rather than reappearing on every boot. Deliberately high rather than the literal
+         // current version, so bumping DEFAULT_STEPS_VERSION does not silently break this test —
+         // a bump SHOULD reconcile again, which is a different case.
+         redisHashes[REDIS_STEPS_VERSION_KEY] = { backend: "99" };
+         projectRepo.findOneBy.mockResolvedValue(makeProject("backend", backendSteps.filter(s => s.step !== "propagate_replicas")));
+
+         await service.onModuleInit();
+
+         expect(projectRepo.save).not.toHaveBeenCalled();
+      });
+
+      it("leaves unparseable step config alone rather than corrupting it", async () => {
+         const broken = makeProject("backend", backendSteps);
+         broken.steps = "{not json";
+         projectRepo.findOneBy.mockResolvedValue(broken);
+
+         await service.onModuleInit();
+
+         expect(projectRepo.save).not.toHaveBeenCalled();
       });
    });
 

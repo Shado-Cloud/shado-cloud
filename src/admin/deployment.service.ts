@@ -61,7 +61,9 @@ interface DeploymentEvent {
       /** A log delta for one replica. */
       | "replica_output"
       /** Terminal propagation snapshot. */
-      | "replica_done";
+      | "replica_done"
+      /** The propagation step finished building and staging its image. */
+      | "replica_image_staged";
    step?: string;
    output?: string;
    status?: StepStatus;
@@ -88,6 +90,19 @@ interface DeploymentEvent {
 const REDIS_KEY_CURRENT = "deployment:current";
 const REDIS_KEY_LAST = "deployment:last";
 const REDIS_KEY_QUEUE = "deployment:queue";
+/** Which default-step additions have been reconciled into each seeded project. */
+const REDIS_KEY_STEPS_VERSION = "deployment:seeded-steps-version";
+
+/**
+ * Bump when adding a step to DEFAULT_PROJECTS that existing installs should also receive.
+ *
+ * `seedDefaults` only ever INSERTED projects, so a step added to the defaults never reached an
+ * environment where the project already existed — and it could not be delivered by migration
+ * either, since `migrations/*.ts` is gitignored in this repo. New steps therefore had to be
+ * hand-added in the admin UI on every environment, which is exactly the kind of manual step that
+ * gets forgotten and then presents as a pipeline that silently does nothing.
+ */
+const DEFAULT_STEPS_VERSION = 2;
 
 /**
  * A sibling package of the primary's own checkout, e.g. `__CWD__/../shado-auth-api`.
@@ -169,19 +184,26 @@ const DEFAULT_PROJECTS: Partial<DeploymentProject>[] = [
          { step: "migrate", name: "Run Migrations", cmd: "npx", args: ["typeorm", "migration:run", "-d", "ormconfig.js"] },
          { step: "restart", name: "Restart Service", cmd: "pm2", args: ["restart", "shado-cloud-backend"], triggersRestart: true },
          { step: "verify", name: "Verify Deployment", cmd: "pm2", args: ["jlist"], runsOnModuleInit: true },
-         // Build the image replicas will run, and prove it boots before any replica is told to
-         // use it. The primary runs node directly, so this image is otherwise never exercised
-         // here — a broken build would first surface on a host you cannot reach.
+         // Get replicas onto this build: builds the image, proves it boots, then hands that one
+         // image to every connected replica and reports each one's progress.
          //
-         // Built from a FRESH CLONE of the superproject, deleted afterwards, so the image
-         // contains exactly what is committed on the branch: no config.yml (real secrets), no
-         // node_modules, no dist/, no uncommitted local changes. It also means the paths below
-         // are relative to a known layout rather than however this host is arranged.
+         // Build and propagate are ONE step because they are one intent. As two, a pipeline could
+         // hold the propagation half with no build to feed it, which presents as a step that spins
+         // and then reports "no replicas" — with nothing in the UI to explain why.
+         //
+         // Built from a FRESH CLONE of the superproject, deleted afterwards, so the image contains
+         // exactly what is committed on the branch: no config.yml (real secrets), no node_modules,
+         // no dist/, no uncommitted local changes. It also means the paths below are relative to a
+         // known layout rather than however this host is arranged.
+         //
+         // Last in the pipeline, so replicas only update once this node has restarted and verified
+         // itself: a primary that fails its own restart never propagates a broken build outwards.
          {
-            step: "build_image",
-            name: "Build Replica Image",
+            step: "propagate_replicas",
+            name: "Propagate to Replicas",
             cmd: "",
             args: [],
+            propagateToReplicas: true,
             buildImage: true,
             sourceRepo: "https://github.com/Shado-Cloud/Shado-Cloud-Services.git",
             sourceBranch: "main",
@@ -192,9 +214,6 @@ const DEFAULT_PROJECTS: Partial<DeploymentProject>[] = [
             imageService: "shado-cloud",
             smokePort: 9000,
          },
-         // Only this project propagates: a replica runs the shado-cloud codebase, so it is
-         // this deployment — not the other services' — that replicas mirror.
-         { step: "propagate_replicas", name: "Propagate to Replicas", cmd: "", args: [], propagateToReplicas: true },
       ] as DeploymentStepConfig[]),
    },
    nestApiProject({ slug: "auth-api", name: "Auth API", dir: "shado-auth-api", pm2: "shado-auth-api" }),
@@ -266,9 +285,83 @@ export class DeploymentService implements OnModuleInit {
          if (!exists) {
             const project = this.projectRepo.create(def);
             await this.projectRepo.save(project);
+            // A fresh row already has every default step, so it starts at the current version.
+            await this.redis.hset(REDIS_KEY_STEPS_VERSION, def.slug!, String(DEFAULT_STEPS_VERSION));
             this.logger.log(`Seeded deployment project: ${def.slug}`);
+         } else {
+            await this.reconcileDefaultSteps(exists, def);
          }
       }
+   }
+
+   /**
+    * Bring an existing project's steps up to the current defaults, without disturbing anything the
+    * operator has set.
+    *
+    * Strictly additive, in two ways:
+    *   - a default step the project lacks is inserted at its position in the defaults
+    *   - a default FIELD absent from an existing step is filled in
+    *
+    * Nothing is removed, reordered or overwritten, so command edits, skip flags and custom steps
+    * survive. Field-level merging matters because a step can gain capabilities: the propagation
+    * step grew image-build settings, and a project that already had a bare `propagate_replicas`
+    * row would otherwise try to build with none of them configured.
+    *
+    * Guarded by a version recorded in Redis rather than re-running every boot, so a step or field
+    * an operator deliberately clears afterwards stays cleared instead of reappearing.
+    */
+   private async reconcileDefaultSteps(project: DeploymentProject, def: Partial<DeploymentProject>): Promise<void> {
+      const applied = Number((await this.redis.hget(REDIS_KEY_STEPS_VERSION, project.slug)) ?? 0);
+      if (applied >= DEFAULT_STEPS_VERSION) return;
+
+      let defaults: DeploymentStepConfig[];
+      let current: DeploymentStepConfig[];
+      try {
+         defaults = JSON.parse(def.steps as string);
+         current = project.getSteps();
+      } catch (e) {
+         this.logger.warn(`Skipping step reconciliation for ${project.slug}: ${(e as Error).message}`);
+         return;
+      }
+
+      const changes: string[] = [];
+      const merged = [...current];
+
+      // 1. Fill in fields a step is missing.
+      for (const step of merged) {
+         const defStep = defaults.find((d) => d.step === step.step);
+         if (!defStep) continue;
+         const added = Object.keys(defStep).filter((k) => !(k in step)) as (keyof DeploymentStepConfig)[];
+         for (const key of added) {
+            (step as unknown as Record<string, unknown>)[key] = (defStep as unknown as Record<string, unknown>)[key];
+         }
+         if (added.length > 0) changes.push(`${step.step}{${added.join(",")}}`);
+      }
+
+      // 2. Insert steps the project lacks entirely, after the last preceding default step it has,
+      //    so relative order matches the defaults without assuming indexes.
+      const have = new Set(merged.map((s) => s.step));
+      for (const step of defaults.filter((s) => !have.has(s.step))) {
+         const defIdx = defaults.findIndex((s) => s.step === step.step);
+         const precedingIds = defaults.slice(0, defIdx).map((s) => s.step);
+         let insertAt = merged.length;
+         for (let i = merged.length - 1; i >= 0; i--) {
+            if (precedingIds.includes(merged[i].step)) {
+               insertAt = i + 1;
+               break;
+            }
+         }
+         merged.splice(insertAt, 0, { ...step });
+         changes.push(`+${step.step}`);
+      }
+
+      if (changes.length > 0) {
+         project.setSteps(merged);
+         await this.projectRepo.save(project);
+         this.logger.log(`Reconciled default steps for ${project.slug}: ${changes.join(", ")}`);
+      }
+
+      await this.redis.hset(REDIS_KEY_STEPS_VERSION, project.slug, String(DEFAULT_STEPS_VERSION));
    }
 
    /**
@@ -516,19 +609,25 @@ export class DeploymentService implements OnModuleInit {
             continue;
          }
 
-         // Build a container image for replicas instead of running a command.
-         if (stepConfig.buildImage) {
-            const failed = await this.runBuildImageStep(stepConfig, projectSlug, workDir, deployment);
-            if (failed) {
-               await this.failDeployment(deployment, stepConfig, projectSlug, deployPageUrl);
-               return;
-            }
+         // A standalone image-build step from before build and propagate were merged. It carries no
+         // command, so falling through would run an empty shell. Skip it with an explanation rather
+         // than deleting it from the operator's pipeline behind their back.
+         if (stepConfig.buildImage && !stepConfig.propagateToReplicas) {
+            stepState.status = "skipped";
+            stepState.output =
+               "Skipped: building the replica image is now part of the \"Propagate to Replicas\" step.\n" +
+               "This step does nothing and can be deleted from the pipeline.\n";
+            deployment.completedSteps[stepConfig.step] = { ...stepState };
+            await this.saveState(deployment, REDIS_KEY_CURRENT);
+            this.emit({ type: "step_output", step: stepConfig.step, output: stepState.output });
+            this.emit({ type: "step_complete", step: stepConfig.step, status: "skipped" });
             continue;
          }
 
-         // Fan the deployment out to every connected replica instead of running a command.
+         // Fan the deployment out to every connected replica instead of running a command. Builds
+         // and stages the image first unless the step opts out.
          if (stepConfig.propagateToReplicas) {
-            const failed = await this.runPropagateStep(stepConfig, projectSlug, deployment);
+            const failed = await this.runPropagateStep(stepConfig, projectSlug, workDir, deployment);
             if (failed) {
                await this.failDeployment(deployment, stepConfig, projectSlug, deployPageUrl);
                return;
@@ -669,6 +768,7 @@ export class DeploymentService implements OnModuleInit {
    private async runPropagateStep(
       stepConfig: DeploymentStepConfig,
       projectSlug: string,
+      workDir: string,
       deployment: DeploymentState,
    ): Promise<boolean> {
       const stepState = deployment.currentStep;
@@ -684,8 +784,28 @@ export class DeploymentService implements OnModuleInit {
          this.emit({ type: "step_output", step: stepConfig.step, output: line });
       };
 
+      // Set when building from a throwaway clone, so it is removed however this step ends.
+      let disposeClone: (() => void) | undefined;
+
       try {
          const project = await this.projectRepo.findOneBy({ slug: projectSlug });
+
+         // Build the image replicas will run, then hand that one image to all of them. One step
+         // rather than two: a separate build step could be missing from a pipeline, leaving the
+         // propagation half with nothing to send — which presents as a step that spins and then
+         // reports "no replicas".
+         if (stepConfig.buildImage !== false) {
+            const built = await this.buildReplicaImage(stepConfig, projectSlug, workDir, project?.branch, appendLog);
+            disposeClone = built.disposeClone;
+            deployment.images = [
+               ...(deployment.images ?? []).filter((i) => i.service !== built.image.service),
+               built.image,
+            ];
+            await this.saveState(deployment, REDIS_KEY_CURRENT);
+            this.emit({ type: "replica_image_staged", step: stepConfig.step, images: deployment.images });
+         } else {
+            appendLog("Image build skipped — replicas will be ordered to deploy themselves from source.\n\n");
+         }
 
          // Replica log deltas are streamed, not persisted per chunk. Persist on a throttle too,
          // so a client that is polling (or reconnecting after the primary's own restart, when
@@ -765,54 +885,47 @@ export class DeploymentService implements OnModuleInit {
          await this.saveState(deployment, REDIS_KEY_CURRENT);
          this.emit({ type: "step_complete", step: stepConfig.step, status: "failed", error: stepState.error, finishedAt: stepState.finishedAt });
          return true;
+      } finally {
+         if (disposeClone) {
+            appendLog("Removing the build clone.\n");
+            disposeClone();
+         }
       }
    }
 
    /**
-    * Build a replica image, prove it boots, and stage it for download.
+    * Build the image replicas will run, prove it boots, and stage it for download.
     *
-    * The staged artifact is held on the deployment so the later propagation step can hand it to
-    * replicas — build and propagate are separate steps so a build failure never reaches a
-    * replica, and so the log for each is separately inspectable in the UI.
+    * Called by the propagation step rather than being a step of its own: the two are one intent,
+    * and separating them let a pipeline hold the propagation half with no build to feed it.
     *
-    * Returns true if the step FAILED.
+    * The smoke test is the part that matters. The primary does not run from an image — it runs
+    * node directly under pm2 — so an image built here is otherwise NEVER exercised until a replica
+    * tries to start it, and a broken one would surface as a remote host that fails to come back
+    * up. Throws on failure, which fails the propagation step before anything is dispatched.
     */
-   private async runBuildImageStep(
+   private async buildReplicaImage(
       stepConfig: DeploymentStepConfig,
       projectSlug: string,
       workDir: string,
-      deployment: DeploymentState,
-   ): Promise<boolean> {
-      const stepState = deployment.currentStep;
-      stepState.status = "running";
-      stepState.startedAt = new Date();
-      stepState.attempt = 1;
-      stepState.maxAttempts = 1;
-      await this.saveState(deployment, REDIS_KEY_CURRENT);
-      this.emit({ type: "step_start", step: stepConfig.step, startedAt: stepState.startedAt });
-
-      const appendLog = (chunk: string) => {
-         stepState.output += chunk;
-         this.emit({ type: "step_output", step: stepConfig.step, output: chunk });
-      };
-
-      // Set when building from a throwaway clone, so it is removed however this step ends.
+      projectBranch: string | undefined,
+      appendLog: (chunk: string) => void,
+   ): Promise<{ image: ReplicaImageRef; disposeClone?: () => void }> {
       let disposeClone: (() => void) | undefined;
 
-      try {
-         // Build from a fresh clone when configured: the image then reflects exactly what is
-         // committed, rather than this host's working tree — which holds a real config.yml,
-         // node_modules, dist/ and possibly uncommitted changes. It also makes the layout inside
-         // the context known, instead of depending on how this host happens to be arranged.
-         let buildDir = workDir;
-         if (stepConfig.sourceRepo) {
-            const project = await this.projectRepo.findOneBy({ slug: projectSlug });
-            const branch = stepConfig.sourceBranch ?? project?.branch ?? "master";
-            const clone = await this.imageBuilder.cloneSource(stepConfig.sourceRepo, branch, appendLog);
-            disposeClone = clone.dispose;
-            buildDir = stepConfig.contextSubdir ? path.join(clone.dir, stepConfig.contextSubdir) : clone.dir;
-         }
+      // Build from a fresh clone when configured: the image then reflects exactly what is
+      // committed, rather than this host's working tree — which holds a real config.yml,
+      // node_modules, dist/ and possibly uncommitted changes. It also makes the layout inside
+      // the context known, instead of depending on how this host happens to be arranged.
+      let buildDir = workDir;
+      if (stepConfig.sourceRepo) {
+         const branch = stepConfig.sourceBranch ?? projectBranch ?? "master";
+         const clone = await this.imageBuilder.cloneSource(stepConfig.sourceRepo, branch, appendLog);
+         disposeClone = clone.dispose;
+         buildDir = stepConfig.contextSubdir ? path.join(clone.dir, stepConfig.contextSubdir) : clone.dir;
+      }
 
+      try {
          const tag = stepConfig.imageTag ?? `${projectSlug}:deploy`;
          const imageId = await this.imageBuilder.build(
             { workDir: buildDir, dockerfile: stepConfig.dockerfile, target: stepConfig.imageTarget, tag },
@@ -829,43 +942,21 @@ export class DeploymentService implements OnModuleInit {
          }
 
          const artifact = await this.imageBuilder.stage(imageId, appendLog);
-         // Carried on the deployment so the propagation step can reference it without rebuilding.
-         deployment.images = [
-            ...(deployment.images ?? []).filter((i) => i.service !== (stepConfig.imageService ?? projectSlug)),
-            {
+         appendLog("\n");
+         return {
+            disposeClone,
+            image: {
                service: stepConfig.imageService ?? projectSlug,
                imageId: artifact.imageId,
                tarSha256: artifact.tarSha256,
                size: artifact.size,
                artifact: artifact.artifact,
             },
-         ];
-
-         stepState.status = "success";
-         stepState.finishedAt = new Date();
-         deployment.completedSteps[stepConfig.step] = { ...stepState };
-         await this.saveState(deployment, REDIS_KEY_CURRENT);
-         this.emit({
-            type: "step_complete",
-            step: stepConfig.step,
-            status: "success",
-            finishedAt: stepState.finishedAt,
-            images: deployment.images,
-         });
-         return false;
+         };
       } catch (e) {
-         stepState.status = "failed";
-         stepState.error = (e as Error).message;
-         stepState.finishedAt = new Date();
-         deployment.completedSteps[stepConfig.step] = { ...stepState };
-         await this.saveState(deployment, REDIS_KEY_CURRENT);
-         this.emit({ type: "step_complete", step: stepConfig.step, status: "failed", error: stepState.error, finishedAt: stepState.finishedAt });
-         return true;
-      } finally {
-         if (disposeClone) {
-            appendLog("Removing the build clone.\n");
-            disposeClone();
-         }
+         // The caller only disposes a clone it was handed back, so clean up on the failure path.
+         disposeClone?.();
+         throw e;
       }
    }
 
