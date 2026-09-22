@@ -266,6 +266,60 @@ export class FilesConstoller {
       }
    }
 
+   /**
+    * The byte range a media request is asking for, clamped to the file.
+    *
+    * `undefined` means it asked for no range (serve the whole file), `"unsatisfiable"` means it
+    * asked for bytes the file does not have (416), and otherwise it is the inclusive range to send.
+    *
+    * The previous parse — split on "-" and `parseInt` both halves — got two cases wrong:
+    *
+    *   * A SUFFIX range (`bytes=-2048`) asks for the LAST n bytes, which is how a player reads the
+    *     structures a container keeps at the end: the final Ogg page, whose granule position IS the
+    *     stream's length, or an MP4 `moov` written after the media. Read as a start offset it came
+    *     out NaN, `createReadStream` threw, and a legal request was answered with 400 and a JSON
+    *     body where the client expected audio.
+    *   * `end` was echoed back unclamped, so `bytes=0-999999999` promised a Content-Length of a
+    *     billion for a 4MB file — a transfer that can never complete.
+    *
+    * Both are real defects, but neither turned out to be the cause of the duration errors reported
+    * on iOS: measured against an iOS 26 simulator, AVFoundation fetched these files with `bytes=0-1`
+    * followed by `bytes=0-<end>` and never asked for a suffix range at all. It over-reports an Ogg
+    * Opus length regardless (172.66s for a 170.02s file) and reads the same audio as m4a exactly, so
+    * the fault there is the container we store, not the transport. This handler is fixed on its own
+    * merits — answering 400 to a valid Range request is wrong however few clients send one.
+    *
+    * Only the first range of a multi-range request is honoured. A real multipart/byteranges reply is
+    * something no media client asks us for, and serving the first is better than failing.
+    */
+   private static parseByteRange(
+      header: string | undefined,
+      total: number,
+   ): { start: number; end: number } | "unsatisfiable" | undefined {
+      if (!header) return undefined;
+      const first = header.trim().split(",")[0].trim();
+      const match = /^bytes=(\d*)-(\d*)$/.exec(first);
+      // Not a form we can serve (a unit other than bytes, or malformed). Ignoring it and sending
+      // the whole file is what RFC 9110 prescribes, and is what every client can handle.
+      if (!match) return undefined;
+
+      const [, rawStart, rawEnd] = match;
+      if (rawStart === "" && rawEnd === "") return undefined;
+      if (total <= 0) return "unsatisfiable";
+
+      if (rawStart === "") {
+         const lastN = parseInt(rawEnd, 10);
+         if (!lastN) return "unsatisfiable"; // `bytes=-0` asks for nothing
+         return { start: Math.max(0, total - lastN), end: total - 1 };
+      }
+
+      const start = parseInt(rawStart, 10);
+      if (start >= total) return "unsatisfiable";
+      const end = rawEnd === "" ? total - 1 : Math.min(parseInt(rawEnd, 10), total - 1);
+      if (end < start) return "unsatisfiable";
+      return { start, end };
+   }
+
    @Get(":path")
    @ApiResponse({ description: "Returns a stream of the requested file" })
    @ApiParam({
@@ -301,34 +355,43 @@ export class FilesConstoller {
             });
          };
 
-         // In case that it is a video or audio
-         // We need to see if this request is for seeking
+         // Media is fetched in pieces — seeking IS a byte range — so this is the path that decides
+         // whether a player can seek a song at all, and whether it can work out how long one is.
          if (fileInto.is_video || fileInto.is_audio) {
             const total = fileInto.size;
-            if (req.headers.range) {
-               const range = req.headers.range;
-               const parts = range.replace(/bytes=/, "").split("-");
-               const partialstart = parts[0];
-               const partialend = parts[1];
+            const wanted = FilesConstoller.parseByteRange(req.headers.range, total);
 
-               const start = parseInt(partialstart, 10);
-               const end = partialend ? parseInt(partialend, 10) : total - 1;
-               const chunksize = end - start + 1;
-
+            if (wanted === "unsatisfiable") {
+               // Telling the client the real size lets it retry with a range that exists, rather
+               // than being handed bytes it did not ask for and having to guess what went wrong.
+               res.writeHead(416, {
+                  "Content-Range": `bytes */${total}`,
+                  "Accept-Ranges": "bytes",
+               });
+               res.end();
+            } else if (wanted) {
+               const { start, end } = wanted;
                const file = await this.fileService.asStream(userId, path, req.headers["user-agent"], {
                   start,
                   end,
                });
                res.writeHead(206, {
-                  "Content-Range": "bytes " + start + "-" + end + "/" + total,
+                  "Content-Range": `bytes ${start}-${end}/${total}`,
                   "Accept-Ranges": "bytes",
-                  "Content-Length": chunksize,
+                  "Content-Length": end - start + 1,
                   "Content-Type": fileInto.mime,
                });
 
                pipeWithCleanup(file);
             } else {
                res.writeHead(200, {
+                  // Advertised even though this response IS the whole file: it is how a client
+                  // learns that it may seek. Without it AVFoundation treats the resource as a
+                  // linear stream it cannot address — so it never reads the length out of the
+                  // container and estimates one from the bitrate instead, and "seeking" becomes
+                  // an extrapolation that lands in the wrong place. A browser gets away with the
+                  // omission by buffering a small file whole; a phone does not.
+                  "Accept-Ranges": "bytes",
                   "Content-Length": total,
                   "Content-Type": fileInto.mime,
                });
