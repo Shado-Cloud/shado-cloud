@@ -1,4 +1,6 @@
 import { createHash } from "crypto";
+import * as os from "os";
+import * as path from "path";
 import { PassThrough, Writable } from "stream";
 import * as childProcess from "child_process";
 import { EventEmitter } from "events";
@@ -124,5 +126,57 @@ describe("ImageArtifactService.export", () => {
 
       expect(lines.join("")).toMatch(/Exporting sha256:abc/);
       expect(lines.join("")).toMatch(/Exported /);
+   });
+});
+
+/**
+ * Gates the "re-send the image we already built" path of a manual propagation. It has to answer
+ * about the BYTES, not about what a past deployment recorded: artifacts are pruned on a TTL and
+ * live in the OS temp dir, so a recorded image id routinely outlives its tarball.
+ */
+describe("ImageArtifactService.has", () => {
+   const artifact = "c".repeat(32);
+   let files: Record<string, boolean>;
+   let service: ImageArtifactService;
+
+   beforeEach(() => {
+      files = {};
+      service = new ImageArtifactService({ get: () => "test-salt" } as never, {
+         existsSync: (p: string) => files[p] === true,
+      } as never);
+   });
+
+   it("is true for a staged artifact", () => {
+      files[path.join(os.tmpdir(), `shado-image-${artifact}.tar`)] = true;
+      expect(service.has(artifact)).toBe(true);
+   });
+
+   it("is false once the artifact has been pruned", () => {
+      expect(service.has(artifact)).toBe(false);
+   });
+
+   /*
+    * The id is interpolated into a filesystem path, so a malformed one is rejected before it gets
+    * near the disk — same shape check `stream` applies. A traversal attempt must not be able to
+    * probe for arbitrary files by way of this predicate.
+    */
+   it("rejects a malformed id without touching the filesystem", () => {
+      const existsSync = jest.fn().mockReturnValue(true);
+      const guarded = new ImageArtifactService({ get: () => "test-salt" } as never, { existsSync } as never);
+
+      expect(guarded.has("../../etc/passwd")).toBe(false);
+      expect(guarded.has("")).toBe(false);
+      expect(guarded.has("C".repeat(32))).toBe(false);
+      expect(existsSync).not.toHaveBeenCalled();
+   });
+
+   it("is false when the filesystem throws", () => {
+      const throwing = new ImageArtifactService({ get: () => "test-salt" } as never, {
+         existsSync: () => {
+            throw new Error("EACCES");
+         },
+      } as never);
+
+      expect(throwing.has(artifact)).toBe(false);
    });
 });

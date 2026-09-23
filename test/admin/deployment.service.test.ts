@@ -117,6 +117,8 @@ describe("DeploymentService", () => {
             tarSha256: "a".repeat(64),
             size: 2 * 1024 * 1024 * 1024,
          }),
+         // Staged artifacts are present by default; tests that care about pruning override it.
+         hasStagedArtifact: jest.fn().mockReturnValue(true),
       };
 
       // No replicas connected by default: propagation is a no-op pass-through.
@@ -841,6 +843,210 @@ describe("DeploymentService", () => {
          await service.onModuleInit();
 
          expect(projectRepo.save).not.toHaveBeenCalled();
+      });
+   });
+
+   describe("manual propagation (startPropagation)", () => {
+      const staged = {
+         service: "shado-cloud",
+         imageId: "sha256:earlier",
+         tarSha256: "b".repeat(64),
+         size: 1024 * 1024 * 1024,
+         artifact: "b".repeat(32),
+      };
+
+      /** Records a finished deployment that staged `images`, as a real run would. */
+      function seedLastDeployment(images: any[]) {
+         redisStore["deployment:last"] = JSON.stringify({
+            id: "deploy_1",
+            project: "propagating",
+            status: "success",
+            currentStep: { step: "propagate_replicas", status: "success", output: "" },
+            completedSteps: {},
+            startedAt: new Date().toISOString(),
+            triggeredBy: "admin",
+            images,
+         });
+      }
+
+      it("runs the propagation step without the pipeline in front of it", async () => {
+         mockSpawnWithPwd(createMockProc());
+
+         await service.startPropagation("propagating", "admin");
+         await new Promise((r) => setTimeout(r, 80));
+
+         expect(replicaPropagation.propagate).toHaveBeenCalledTimes(1);
+         // "build" precedes propagation in this project's pipeline and must NOT have run: the
+         // point is to reach the replicas without touching the primary.
+         const spawnedCmds = (childProcess.spawn as jest.Mock).mock.calls.map((c) => c[0]);
+         expect(spawnedCmds).not.toContain("npm");
+      });
+
+      it("completes as its own deployment record", async () => {
+         mockSpawnWithPwd(createMockProc());
+
+         await service.startPropagation("propagating", "admin");
+         await new Promise((r) => setTimeout(r, 80));
+
+         const deployment = await service.getCurrentDeployment();
+         expect(deployment?.id).toMatch(/^propagate_/);
+         expect(deployment?.status).toBe("success");
+         expect(deployment?.completedSteps["propagate_replicas"].status).toBe("success");
+      });
+
+      it("emits the propagation SSE events a client renders", async () => {
+         mockSpawnWithPwd(createMockProc());
+
+         const subject = await service.startPropagation("propagating", "admin");
+         const events: any[] = [];
+         subject.subscribe((event) => events.push(JSON.parse((event as any).data)));
+         await new Promise((r) => setTimeout(r, 80));
+
+         expect(events.some((e) => e.type === "step_start" && e.step === "propagate_replicas")).toBe(true);
+         expect(events.some((e) => e.type === "replica_dispatch")).toBe(true);
+         expect(events.some((e) => e.type === "deployment_complete")).toBe(true);
+      });
+
+      it("throws when the project has no propagation step", async () => {
+         await expect(service.startPropagation("frontend", "admin")).rejects.toThrow(
+            'Project "frontend" has no "Propagate to Replicas" step',
+         );
+      });
+
+      it("throws when the project does not exist", async () => {
+         await expect(service.startPropagation("nonexistent", "admin")).rejects.toThrow("not found");
+      });
+
+      it("throws when a deployment is already running", async () => {
+         mockSpawnWithPwd(createMockProc());
+         await service.startDeployment("backend", "admin");
+
+         await expect(service.startPropagation("backend", "admin")).rejects.toThrow("Deployment already in progress");
+      });
+
+      /*
+       * A propagation with no replicas online SUCCEEDS — correctly, since a replica-less install
+       * must not fail every deployment. That also means retryStep, which needs a failed deployment
+       * and a failed step, has nothing to retry. This button is the only route back for a replica
+       * that was merely asleep, so it must run regardless of the step's skip flag: honouring it
+       * would give an operator a button that reports success having done nothing.
+       */
+      it("runs even when the step is flagged to be skipped", async () => {
+         const skipped = propagateSteps.map((s) => (s.propagateToReplicas ? { ...s, skip: true } : s));
+         projectRepo.findOneBy.mockImplementation(({ slug }: any) =>
+            Promise.resolve(slug === "propagating" ? makeProject("propagating", skipped) : null),
+         );
+         mockSpawnWithPwd(createMockProc());
+
+         await service.startPropagation("propagating", "admin");
+         await new Promise((r) => setTimeout(r, 80));
+
+         expect(replicaPropagation.propagate).toHaveBeenCalledTimes(1);
+         expect((await service.getCurrentDeployment())?.completedSteps["propagate_replicas"].status).toBe("success");
+      });
+
+      describe("reusing an already-staged image", () => {
+         const imageSteps = [
+            { step: "build", name: "Build", cmd: "npm", args: ["run", "build"] },
+            {
+               step: "propagate_replicas",
+               name: "Propagate to Replicas",
+               cmd: "",
+               args: [],
+               propagateToReplicas: true,
+               buildImage: true,
+               sourceRepo: "git@github.com:Shado-Cloud/Shado-Cloud-Services.git",
+               contextSubdir: "shado-cloud",
+               imageService: "shado-cloud",
+            },
+         ];
+
+         beforeEach(() => {
+            projectRepo.findOneBy.mockImplementation(({ slug }: any) =>
+               Promise.resolve(slug === "propagating" ? makeProject("propagating", imageSteps) : null),
+            );
+         });
+
+         it("dispatches the staged image without cloning or rebuilding", async () => {
+            seedLastDeployment([staged]);
+            mockSpawnWithPwd(createMockProc());
+
+            await service.startPropagation("propagating", "admin", { reuseImage: true });
+            await new Promise((r) => setTimeout(r, 80));
+
+            expect(imageBuilder.cloneSource).not.toHaveBeenCalled();
+            expect(imageBuilder.build).not.toHaveBeenCalled();
+            expect(replicaPropagation.propagate.mock.calls[0][0].images).toEqual([staged]);
+         });
+
+         it("rebuilds when reuse is not requested", async () => {
+            seedLastDeployment([staged]);
+            mockSpawnWithPwd(createMockProc());
+
+            await service.startPropagation("propagating", "admin");
+            await new Promise((r) => setTimeout(r, 120));
+
+            expect(imageBuilder.build).toHaveBeenCalledTimes(1);
+            expect(replicaPropagation.propagate.mock.calls[0][0].images).toEqual([
+               expect.objectContaining({ imageId: "sha256:builtimage" }),
+            ]);
+         });
+
+         /*
+          * Artifacts are pruned on a TTL and live in the OS temp dir, so an image recorded by a
+          * past deployment is not evidence the bytes are still there. Refused here rather than
+          * dispatched, because the alternative — falling through with no images — would order the
+          * replica down the source-deployment path instead, which is a different operation
+          * entirely and not what was asked for.
+          */
+         it("refuses when the staged artifact has been pruned", async () => {
+            seedLastDeployment([staged]);
+            imageBuilder.hasStagedArtifact.mockReturnValue(false);
+
+            await expect(service.startPropagation("propagating", "admin", { reuseImage: true })).rejects.toThrow(
+               "No image from a previous run is still staged",
+            );
+            expect(replicaPropagation.propagate).not.toHaveBeenCalled();
+         });
+
+         it("refuses when no previous run staged anything", async () => {
+            await expect(service.startPropagation("propagating", "admin", { reuseImage: true })).rejects.toThrow(
+               "No image from a previous run is still staged",
+            );
+         });
+      });
+
+      describe("availableStagedImages", () => {
+         it("is empty with no deployment history", async () => {
+            expect(await service.availableStagedImages()).toEqual([]);
+         });
+
+         it("reports images whose artifacts are still on disk", async () => {
+            seedLastDeployment([staged]);
+            expect(await service.availableStagedImages()).toEqual([staged]);
+            expect(imageBuilder.hasStagedArtifact).toHaveBeenCalledWith(staged.artifact);
+         });
+
+         it("drops images whose artifacts are gone", async () => {
+            seedLastDeployment([staged]);
+            imageBuilder.hasStagedArtifact.mockReturnValue(false);
+            expect(await service.availableStagedImages()).toEqual([]);
+         });
+      });
+
+      describe("getPropagationStep", () => {
+         it("returns the step for a project that has one", async () => {
+            const step = await service.getPropagationStep("propagating");
+            expect(step?.step).toBe("propagate_replicas");
+         });
+
+         it("returns null for a project without one", async () => {
+            expect(await service.getPropagationStep("frontend")).toBeNull();
+         });
+
+         it("returns null for an unknown project", async () => {
+            expect(await service.getPropagationStep("nonexistent")).toBeNull();
+         });
       });
    });
 

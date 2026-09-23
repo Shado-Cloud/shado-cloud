@@ -395,6 +395,17 @@ export class ImageBuildService {
    }
 
    /**
+    * Whether an image staged by an earlier build can still be handed to a replica.
+    *
+    * Used to decide whether a manual propagation may skip the build and re-send what is already
+    * there. Artifacts are pruned on a TTL and live in the OS temp dir, so a past deployment
+    * recording an image is not proof the bytes survive.
+    */
+   public hasStagedArtifact(artifact: string): boolean {
+      return this.artifacts.has(artifact);
+   }
+
+   /**
     * Run a command, resolving with its stdout. `onLog` receives stdout and stderr as they arrive
     * so a long build streams into the deployment log rather than appearing all at once.
     */

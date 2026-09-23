@@ -189,6 +189,25 @@ export class ImageArtifactService {
       res.on("finish", () => this.logger.log(`Streamed image artifact ${artifact}`));
    }
 
+   /**
+    * Whether a staged artifact is still on disk.
+    *
+    * Lets a caller offer "re-send the image we already built" only when that is actually possible:
+    * artifacts are pruned after {@link ARTIFACT_TTL_MS}, and the primary's temp dir does not
+    * survive a host reboot, so an image id recorded in a past deployment's state is not evidence
+    * the bytes are still there. Dispatching against a missing artifact would fail on the replica,
+    * mid-deployment, instead of here.
+    */
+   public has(artifact: string): boolean {
+      // Same shape check as `stream`: the id builds a filesystem path.
+      if (!/^[a-f0-9]{32}$/.test(artifact)) return false;
+      try {
+         return this.fs.existsSync(this.artifactPath(artifact));
+      } catch {
+         return false;
+      }
+   }
+
    /** Deletes staged artifacts older than the TTL. Best-effort; never throws. */
    public pruneOld(): void {
       try {

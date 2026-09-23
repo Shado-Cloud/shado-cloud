@@ -11,6 +11,7 @@ import {
    Patch,
    Post,
    Put,
+   Query,
    Headers,
    UnauthorizedException,
    Sse,
@@ -170,6 +171,10 @@ export class DeploymentController {
          current: await this.deploymentService.getCurrentDeployment(),
          last: await this.deploymentService.getLastDeployment(),
          queue: await this.deploymentService.getQueue(),
+         // Images from the most recent run that are STILL staged on this host, so the UI can offer
+         // "re-send the build we already have" only when that will actually work. Artifacts are
+         // pruned on a TTL, so what a past deployment recorded is not proof the bytes survive.
+         stagedImages: await this.deploymentService.availableStagedImages(),
       };
    }
 
@@ -189,6 +194,32 @@ export class DeploymentController {
    @Sse()
    public async startDeployment(@Param("project") project: string): Promise<Observable<MessageEvent>> {
       const subject = await this.deploymentService.startDeployment(project, "admin");
+      return subject.asObservable();
+   }
+
+   /**
+    * Run ONLY the "Propagate to Replicas" step, without the pipeline in front of it.
+    *
+    * For the case the normal flow cannot address: a propagation with no replicas online is a
+    * success, not a failure, so `deployment/retry/:step` — which needs a failed deployment and a
+    * failed step — has nothing to retry. A replica that was merely offline when the deployment ran
+    * would otherwise need a full redeploy of the primary to get onto the current build.
+    *
+    * `?reuseImage=true` re-sends an image an earlier run already built, staged and smoke-tested,
+    * skipping the clone and rebuild. That is the usual intent here: the build was fine, the
+    * replicas just were not there. It is refused if the artifact is no longer on disk rather than
+    * quietly degrading to a source deployment.
+    */
+   @Get("deployment/propagate/:project")
+   @UseGuards(JwtAuthGuard, AdminGuard)
+   @Sse()
+   public async propagateToReplicas(
+      @Param("project") project: string,
+      @Query("reuseImage") reuseImage?: string,
+   ): Promise<Observable<MessageEvent>> {
+      const subject = await this.deploymentService.startPropagation(project, "admin", {
+         reuseImage: reuseImage === "true" || reuseImage === "1",
+      });
       return subject.asObservable();
    }
 

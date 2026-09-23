@@ -604,6 +604,121 @@ export class DeploymentService implements OnModuleInit {
       return this.deploymentSubject;
    }
 
+   /**
+    * The project's propagation step, or null if it has none.
+    *
+    * Only one makes sense per pipeline, so the first is the answer.
+    */
+   public async getPropagationStep(projectSlug: string): Promise<DeploymentStepConfig | null> {
+      const project = await this.projectRepo.findOneBy({ slug: projectSlug });
+      if (!project) return null;
+      try {
+         return project.getSteps().find((s) => s.propagateToReplicas) ?? null;
+      } catch {
+         return null;
+      }
+   }
+
+   /**
+    * Images from the most recent run whose artifacts are STILL on disk, and can therefore be
+    * handed to a replica without rebuilding.
+    *
+    * Filtered rather than reported from the deployment state alone: artifacts are pruned on a TTL
+    * and live in the OS temp dir, so a recorded image is not evidence the bytes survive. Offering
+    * a re-send that cannot work would fail on the replica mid-deployment instead of here.
+    */
+   public async availableStagedImages(): Promise<ReplicaImageRef[]> {
+      const state = (await this.getState(REDIS_KEY_CURRENT)) ?? (await this.getState(REDIS_KEY_LAST));
+      return (state?.images ?? []).filter((i) => this.imageBuilder.hasStagedArtifact(i.artifact));
+   }
+
+   /**
+    * Run the propagation step ON ITS OWN, without the pipeline in front of it.
+    *
+    * This exists because a propagation with no replicas online is a SUCCESS, not a failure — the
+    * step logs "nothing to propagate to" and passes through, which is correct (a replica-less
+    * install must not fail every deployment). But it also means `retryStep` cannot help: it
+    * requires a failed deployment and a failed step. So a replica that happened to be offline
+    * during the deployment had no way back onto the current build short of redeploying the
+    * primary — restarting a healthy production process to fix a remote node that was merely
+    * asleep.
+    *
+    * `reuseImage` re-sends an image an earlier run already built and staged, skipping the clone,
+    * build and smoke test. That is the common case for this button: the build was fine, the
+    * replicas simply were not there to receive it. Verified present first — see
+    * {@link availableStagedImages} — and refused rather than silently falling back to a source
+    * deployment, which would order the replica down a completely different path.
+    */
+   public async startPropagation(
+      projectSlug: string,
+      triggeredBy: string,
+      opts: { reuseImage?: boolean } = {},
+   ): Promise<Subject<MessageEvent>> {
+      if (await this.isRunning()) {
+         throw new Error("Deployment already in progress");
+      }
+
+      const project = await this.projectRepo.findOneBy({ slug: projectSlug });
+      if (!project) throw new Error(`Project "${projectSlug}" not found`);
+      if (!project.enabled) throw new Error(`Project "${projectSlug}" is disabled`);
+
+      const configured = project.getSteps().find((s) => s.propagateToReplicas);
+      if (!configured) {
+         throw new Error(`Project "${projectSlug}" has no "Propagate to Replicas" step to run`);
+      }
+
+      const workDir = this.resolveWorkDir(project);
+      if (!workDir) {
+         throw new Error(`Working directory not configured for project "${projectSlug}"`);
+      }
+
+      // `skip` is cleared: an operator pressing the button is an explicit instruction, and
+      // honouring the flag here would produce a button that reports success having done nothing.
+      const stepConfig: DeploymentStepConfig = { ...configured, skip: false };
+
+      let images: ReplicaImageRef[] | undefined;
+      if (opts.reuseImage) {
+         images = await this.availableStagedImages();
+         if (images.length === 0) {
+            throw new Error(
+               "No image from a previous run is still staged on this host — propagate with a rebuild instead",
+            );
+         }
+         stepConfig.buildImage = false;
+      }
+
+      this.deploymentSubject = new Subject<MessageEvent>();
+      this.cancelled = false;
+      const deployment: DeploymentState = {
+         id: `propagate_${Date.now()}`,
+         project: projectSlug,
+         status: "running",
+         currentStep: {
+            step: stepConfig.step,
+            status: "pending",
+            output: "",
+            attempt: 1,
+            maxAttempts: 1,
+         },
+         completedSteps: {},
+         startedAt: new Date(),
+         triggeredBy,
+         images,
+      };
+      await this.saveState(deployment, REDIS_KEY_CURRENT);
+
+      this.logger.log(
+         `Manual replica propagation for ${projectSlug} (triggered by ${triggeredBy})` +
+            `${opts.reuseImage ? ` — re-sending ${images!.length} staged image(s)` : " — rebuilding the image"}`,
+      );
+
+      // Through runDeployment, so the feature-flag gate, notifications and queue hand-off behave
+      // exactly as they do for a full pipeline. A one-step pipeline is still a deployment.
+      void this.runDeployment([stepConfig], workDir, projectSlug, deployment);
+
+      return this.deploymentSubject;
+   }
+
    // --- Internal ---
 
    private getFollowingSteps(step: StepState, allSteps: DeploymentStepConfig[]) {
@@ -836,6 +951,16 @@ export class DeploymentService implements OnModuleInit {
             ];
             await this.saveState(deployment, REDIS_KEY_CURRENT);
             this.emit({ type: "replica_image_staged", step: stepConfig.step, images: deployment.images });
+         } else if (deployment.images?.length) {
+            // Re-sending what an earlier run staged. Distinguished from the no-image case below
+            // because the two order replicas down completely different paths — an image swap
+            // applied by the updater, versus each replica building from source — and reporting
+            // the wrong one would send an operator looking in the wrong place.
+            appendLog(`Re-sending ${deployment.images.length} image(s) staged by an earlier run; no rebuild.\n`);
+            for (const img of deployment.images) {
+               appendLog(`  - ${img.service}: ${img.imageId.slice(0, 19)}… (${Math.round(img.size / 1024 / 1024)}MB)\n`);
+            }
+            appendLog("\n");
          } else {
             appendLog("Image build skipped — replicas will be ordered to deploy themselves from source.\n\n");
          }
