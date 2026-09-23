@@ -1,5 +1,58 @@
 import { BaseEntity, Column, CreateDateColumn, Entity, PrimaryGeneratedColumn, UpdateDateColumn } from "typeorm";
 
+/**
+ * One service image a propagation step builds and hands to replicas.
+ *
+ * A replica that is only a mirror needs shado-cloud alone. A replica that can take over needs
+ * every service, so a propagation step builds a LIST of these — one per compose service on the
+ * replica. They share a single clone of the superproject, since each service is a submodule of it.
+ *
+ * The delivery protocol already carried an array (`ReplicaImageRef[]`, keyed by compose service),
+ * and the replica's updater already loops over it and tags per service. Only the build side was
+ * single-image.
+ */
+export interface ReplicaServiceBuildSpec {
+   /**
+    * Compose service name on the REPLICA — this is what the replica's updater matches against to
+    * know which container to recreate, and what its per-service health gate resolves. It must
+    * match a service in the replica's docker-compose.yml or the deployment has nowhere to land.
+    */
+   service: string;
+   /**
+    * Subdirectory of the clone to use as the build context, e.g. `shado-auth-api`. Also the
+    * submodule checked out at its branch tip. Omit to use the clone root.
+    */
+   contextSubdir?: string;
+   /** Dockerfile path relative to the build context. */
+   dockerfile?: string;
+   /** Multi-stage target. Defaults to `runtime`. */
+   imageTarget?: string;
+   /** Local tag for the built image. Defaults to `<service>:deploy`. */
+   imageTag?: string;
+   /** Container port the smoke test probes. Defaults to 9000. */
+   smokePort?: number;
+   /** Path the smoke test probes. Defaults to `/health`. */
+   smokePath?: string;
+   /**
+    * Absolute path ON THE PRIMARY to a config file mounted at /app/config.yml for the smoke test.
+    * Supports the `__CWD__` prefix. When omitted a throwaway placeholder is generated.
+    */
+   smokeConfigFile?: string;
+   /**
+    * Absolute path ON THE PRIMARY to an env file copied into the build context before building.
+    * Supports the `__CWD__` prefix.
+    *
+    * This is what makes a frontend buildable from a clean clone at all. SvelteKit frontends are
+    * `adapter-static` + Vite, so `VITE_*` values are compiled INTO the bundle at build time — and
+    * their `.env` files are gitignored, so a fresh clone contains none of them and would produce a
+    * bundle pointing at nothing. The file is copied in for the build and removed afterwards, so it
+    * never reaches an image layer.
+    */
+   envFile?: string;
+   /** Set false to stage without smoke-testing first. */
+   smokeTest?: boolean;
+}
+
 export interface DeploymentStepConfig {
    step: string;
    name: string;
@@ -57,27 +110,43 @@ export interface DeploymentStepConfig {
    /** Propagation only. Branch to clone. Defaults to the project's `branch`. */
    sourceBranch?: string;
    /**
+    * Propagation only. Every service image to build and deliver, one per compose service on the
+    * replica. Built from one shared clone of `sourceRepo`.
+    *
+    * This is what lets a replica act as a FAILOVER node rather than just a file mirror: it has to
+    * be running every service, not only shado-cloud. The delivery protocol already carried an
+    * array and the replica's updater already loops over it — only the build side was single-image.
+    *
+    * When absent, the legacy single-image fields below are used as a one-element list, so a
+    * pipeline configured before this existed keeps behaving exactly as it did.
+    */
+   services?: ReplicaServiceBuildSpec[];
+   /**
     * Propagation only. Subdirectory of the clone to use as the build context, e.g. `shado-cloud`
     * when cloning the services superproject. Omit to use the clone root.
+    *
+    * Legacy single-image field — superseded by `services`, and ignored when that is set.
     */
    contextSubdir?: string;
-   /** Propagation only. Dockerfile path relative to the build context. */
+   /** Propagation only. Dockerfile path relative to the build context. Superseded by `services`. */
    dockerfile?: string;
-   /** Propagation only. Multi-stage target. Defaults to `runtime`. */
+   /** Propagation only. Multi-stage target. Defaults to `runtime`. Superseded by `services`. */
    imageTarget?: string;
-   /** Propagation only. Local tag for the built image. Defaults to `<slug>:deploy`. */
+   /** Propagation only. Local tag for the built image. Defaults to `<slug>:deploy`. Superseded by `services`. */
    imageTag?: string;
    /**
     * Propagation only. Compose service name the image belongs to on a replica — this is what the
     * replica's updater matches against to know which container to recreate.
+    *
+    * Superseded by `services`.
     */
    imageService?: string;
    /**
     * Propagation only. Absolute path to a config file mounted at /app/config.yml during the smoke
-    * test. When omitted a throwaway placeholder is generated.
+    * test. When omitted a throwaway placeholder is generated. Superseded by `services`.
     */
    smokeConfigFile?: string;
-   /** Propagation only. Container port the smoke test probes /health on. Defaults to 9000. */
+   /** Propagation only. Container port the smoke test probes /health on. Defaults to 9000. Superseded by `services`. */
    smokePort?: number;
    /** Propagation only. Set false to stage the image without smoke-testing it first. */
    smokeTest?: boolean;

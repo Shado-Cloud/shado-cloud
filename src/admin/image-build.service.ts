@@ -27,6 +27,8 @@ export interface SmokeTestOptions {
    configFile?: string;
    /** Port inside the container to probe. */
    port: number;
+   /** Path to probe. Defaults to `/health`. */
+   path?: string;
    /** How long to wait for /health to answer before declaring the image bad. */
    timeoutMs?: number;
 }
@@ -217,6 +219,50 @@ export class ImageBuildService {
       );
    }
 
+   /**
+    * Copy an env file from this host into a build context, returning a disposer that removes it.
+    *
+    * This is the only way a SvelteKit frontend can be built from a clean clone. They are
+    * `adapter-static` + Vite, so `VITE_*` values are compiled INTO the bundle at build time, and
+    * their `.env` files are gitignored — a fresh clone therefore contains none of them and would
+    * produce a bundle whose API URLs are undefined. The build needs the values, but the REPOSITORY
+    * must not carry them, so they come from the primary at build time instead.
+    *
+    * Written as `.env` in the context root, which is where Vite looks. Removed afterwards so it
+    * cannot be picked up by a later build in the same directory. Keeping it out of the resulting
+    * IMAGE is the Dockerfile's job: the runtime stage copies build output only, never the context.
+    *
+    * Refuses rather than silently continuing when the source is missing — a frontend built with no
+    * env produces a bundle that loads and then fails every request, which is far harder to
+    * diagnose than a failed build.
+    */
+   public stageEnvFile(envFile: string, contextDir: string, onLog: (chunk: string) => void): () => void {
+      const source = path.resolve(envFile);
+      if (!fs.existsSync(source)) {
+         throw new Error(
+            `Env file ${source} does not exist on this host. It supplies the build-time values a ` +
+            `frontend bakes into its bundle, and the repository deliberately does not carry them — ` +
+            `check the step's envFile path.`,
+         );
+      }
+
+      const target = path.join(contextDir, ".env");
+      // A fresh clone has no .env (it is gitignored), but do not destroy one if it is somehow
+      // there: restore whatever was present on the way out.
+      const previous = fs.existsSync(target) ? fs.readFileSync(target) : null;
+      fs.copyFileSync(source, target);
+      onLog(`Staged build-time env from ${source} into the build context.\n`);
+
+      return () => {
+         try {
+            if (previous) fs.writeFileSync(target, previous);
+            else if (fs.existsSync(target)) fs.unlinkSync(target);
+         } catch (e) {
+            this.logger.warn(`Could not clean up ${target}: ${(e as Error).message}`);
+         }
+      };
+   }
+
    /** Build an image and return its image ID. */
    public async build(opts: ImageBuildOptions, onLog: (chunk: string) => void): Promise<string> {
       if (!(await this.isDockerAvailable())) {
@@ -289,7 +335,7 @@ export class ImageBuildService {
             }
 
             try {
-               const res = await fetch(`http://127.0.0.1:${hostPort}/health`, { signal: AbortSignal.timeout(4000) });
+               const res = await fetch(`http://127.0.0.1:${hostPort}${opts.path ?? "/health"}`, { signal: AbortSignal.timeout(4000) });
                if (res.ok) {
                   const body = await res.text();
                   onLog(`Smoke test passed: ${body}\n`);

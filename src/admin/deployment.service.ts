@@ -11,7 +11,7 @@ import type Redis from "ioredis";
 import { REDIS_CACHE } from "src/util";
 import { InjectRepository } from "@nestjs/typeorm";
 import { Repository } from "typeorm";
-import { DeploymentProject, DeploymentStepConfig } from "src/models/admin/deploymentProject";
+import { DeploymentProject, DeploymentStepConfig, ReplicaServiceBuildSpec } from "src/models/admin/deploymentProject";
 import { ReplicaPropagationService, type ReplicaPropagationState, type ReplicaRunState } from "./replica-propagation.service";
 import { ImageBuildService } from "./image-build.service";
 import type { ReplicaImageRef } from "src/replication/replica-link.constants";
@@ -101,8 +101,13 @@ const REDIS_KEY_STEPS_VERSION = "deployment:seeded-steps-version";
  * either, since `migrations/*.ts` is gitignored in this repo. New steps therefore had to be
  * hand-added in the admin UI on every environment, which is exactly the kind of manual step that
  * gets forgotten and then presents as a pipeline that silently does nothing.
+ *
+ * v4 adds `services` to the propagation step, so an existing pipeline starts building every
+ * service rather than shado-cloud alone. Field-level merging delivers it because `services` is
+ * absent from an older step; the legacy single-image fields stay on the row but go inert, since
+ * `serviceSpecs()` prefers `services` whenever it is set.
  */
-const DEFAULT_STEPS_VERSION = 3;
+const DEFAULT_STEPS_VERSION = 4;
 
 /**
  * SSH rather than HTTPS. An HTTPS clone needs a username and token, and running unattended there
@@ -134,6 +139,110 @@ const LEGACY_STEP_VALUE_FIXUPS: { step: string; field: keyof DeploymentStepConfi
  * dev workspace and on a host where the repos sit next to each other.
  */
 const sibling = (dir: string): string => `__CWD__/../${dir}`;
+
+/**
+ * Every service image delivered to a replica, in build order.
+ *
+ * All of them, not just shado-cloud, because a replica that can TAKE OVER has to be running the
+ * whole stack — a mirror needs the file tree, a failover node needs the services. They are built
+ * from one shared clone of the superproject, each from its own submodule.
+ *
+ * `service` must match a compose service on the replica: it is what the replica's updater looks up
+ * to know which container to recreate, and what its per-service health gate resolves.
+ *
+ * ── On smoke tests ──
+ * The smoke test boots the image with no dependencies reachable and probes /health, so a broken
+ * image is caught on the primary rather than on a remote host that then fails to come back up.
+ *
+ * That works for shado-cloud (with `role: replica` it boots ReplicationModule, which needs no
+ * database) and for the frontends (nginx serving static files needs nothing at all). It does NOT
+ * work for the other four APIs: they boot AppModule, which connects to MySQL and Redis during
+ * startup, so a dependency-less container exits before it can answer. They are therefore staged
+ * unverified, and the safety net for them is the replica updater's per-service health gate, which
+ * rolls each service back to its previous image if it does not come up. Giving them a throwaway
+ * dependency stack at smoke time would restore the earlier check and is worth doing.
+ */
+const REPLICA_SERVICES: ReplicaServiceBuildSpec[] = [
+   {
+      service: "shado-cloud",
+      contextSubdir: "shado-cloud",
+      dockerfile: "../Dockerfile.shado-cloud",
+      imageTarget: "runtime",
+      imageTag: "shado-cloud:deploy",
+      smokePort: 9000,
+   },
+   {
+      service: "shado-auth-api",
+      contextSubdir: "shado-auth-api",
+      dockerfile: "../Dockerfile.nestjs",
+      imageTarget: "runtime",
+      imageTag: "shado-auth-api:deploy",
+      smokePort: 11001,
+      // Boots AppModule, which connects to MySQL/Redis at startup — see the note above.
+      smokeTest: false,
+   },
+   {
+      service: "shado-metrics",
+      contextSubdir: "shado-metrics",
+      dockerfile: "../Dockerfile.nestjs",
+      imageTarget: "runtime",
+      imageTag: "shado-metrics:deploy",
+      smokePort: 14001,
+      smokeTest: false,
+   },
+   {
+      service: "shado-music-api",
+      contextSubdir: "shado-music-api",
+      dockerfile: "../Dockerfile.shado-music-api",
+      imageTarget: "runtime",
+      imageTag: "shado-music-api:deploy",
+      smokePort: 16001,
+      smokeTest: false,
+   },
+   {
+      service: "shado-gym-api",
+      contextSubdir: "shado-gym-api",
+      dockerfile: "../Dockerfile.nestjs",
+      imageTarget: "runtime",
+      imageTag: "shado-gym-api:deploy",
+      smokePort: 15001,
+      smokeTest: false,
+   },
+   // Frontends are `adapter-static` + Vite, so their VITE_* values are compiled INTO the bundle at
+   // build time — there is nothing to mount at runtime. Their `.env` files are gitignored, so a
+   // clean clone cannot build them; `envFile` supplies the values from this host for the duration
+   // of the build. The runtime stage copies build output only, so they never reach an image layer.
+   //
+   // Served by nginx on port 80, which also answers /health with the same {"ok":true} shape the
+   // APIs use, so the replica updater has one health contract to gate every swap on.
+   {
+      service: "shado-cloud-frontend",
+      contextSubdir: "shado-cloud-frontend",
+      dockerfile: "../Dockerfile.sveltekit",
+      imageTarget: "runtime",
+      imageTag: "shado-cloud-frontend:deploy",
+      envFile: sibling("shado-cloud-frontend/.env"),
+      smokePort: 80,
+   },
+   {
+      service: "shado-music-frontend",
+      contextSubdir: "shado-music-frontend",
+      dockerfile: "../Dockerfile.sveltekit",
+      imageTarget: "runtime",
+      imageTag: "shado-music-frontend:deploy",
+      envFile: sibling("shado-music-frontend/.env"),
+      smokePort: 80,
+   },
+   {
+      service: "shado-gym-app",
+      contextSubdir: "shado-gym-app",
+      dockerfile: "../Dockerfile.sveltekit",
+      imageTarget: "runtime",
+      imageTag: "shado-gym-app:deploy",
+      envFile: sibling("shado-gym-app/.env"),
+      smokePort: 80,
+   },
+];
 
 /**
  * A NestJS API deployed on this host under pm2.
@@ -231,12 +340,9 @@ const DEFAULT_PROJECTS: Partial<DeploymentProject>[] = [
             buildImage: true,
             sourceRepo: SERVICES_REPO_SSH,
             sourceBranch: "main",
-            contextSubdir: "shado-cloud",
-            dockerfile: "../Dockerfile.shado-cloud",
-            imageTarget: "runtime",
-            imageTag: "shado-cloud:deploy",
-            imageService: "shado-cloud",
-            smokePort: 9000,
+            // EVERY service, not just shado-cloud — a replica that can take over has to be running
+            // the whole stack. All built from the one clone above.
+            services: REPLICA_SERVICES,
          },
       ] as DeploymentStepConfig[]),
    },
@@ -454,7 +560,7 @@ export class DeploymentService implements OnModuleInit {
       return current?.status === "running";
    }
 
-   public async getSteps(projectSlug: string): Promise<{ step: string; name: string; skip?: boolean; propagateToReplicas?: boolean; buildImage?: boolean; imageService?: string }[]> {
+   public async getSteps(projectSlug: string): Promise<{ step: string; name: string; skip?: boolean; propagateToReplicas?: boolean; buildImage?: boolean; imageService?: string; services?: string[] }[]> {
       const project = await this.projectRepo.findOneBy({ slug: projectSlug });
       if (!project) return [];
       // cmd/args are deliberately withheld, but the step KIND has to be exposed: the UI renders
@@ -466,6 +572,10 @@ export class DeploymentService implements OnModuleInit {
          propagateToReplicas: s.propagateToReplicas,
          buildImage: s.buildImage,
          imageService: s.imageService,
+         // Names only. The UI lists what a propagation step will build — including before it runs,
+         // when there are no staged images to infer the list from — but the specs themselves carry
+         // host paths (envFile, smokeConfigFile) that an API response has no reason to disclose.
+         services: this.serviceSpecs(s, projectSlug).map(spec => spec.service),
       }));
    }
 
@@ -943,11 +1053,14 @@ export class DeploymentService implements OnModuleInit {
          // propagation half with nothing to send — which presents as a step that spins and then
          // reports "no replicas".
          if (stepConfig.buildImage !== false) {
-            const built = await this.buildReplicaImage(stepConfig, projectSlug, workDir, project?.branch, appendLog);
+            const built = await this.buildReplicaImages(stepConfig, projectSlug, workDir, project?.branch, appendLog);
             disposeClone = built.disposeClone;
+            // Replace by service rather than appending, so re-running the step does not leave a
+            // stale entry for a service alongside its rebuild.
+            const rebuilt = new Set(built.images.map((i) => i.service));
             deployment.images = [
-               ...(deployment.images ?? []).filter((i) => i.service !== built.image.service),
-               built.image,
+               ...(deployment.images ?? []).filter((i) => !rebuilt.has(i.service)),
+               ...built.images,
             ];
             await this.saveState(deployment, REDIS_KEY_CURRENT);
             this.emit({ type: "replica_image_staged", step: stepConfig.step, images: deployment.images });
@@ -1052,72 +1165,144 @@ export class DeploymentService implements OnModuleInit {
    }
 
    /**
-    * Build the image replicas will run, prove it boots, and stage it for download.
+    * The services this step builds, as an explicit list.
     *
-    * Called by the propagation step rather than being a step of its own: the two are one intent,
-    * and separating them let a pipeline hold the propagation half with no build to feed it.
-    *
-    * The smoke test is the part that matters. The primary does not run from an image — it runs
-    * node directly under pm2 — so an image built here is otherwise NEVER exercised until a replica
-    * tries to start it, and a broken one would surface as a remote host that fails to come back
-    * up. Throws on failure, which fails the propagation step before anything is dispatched.
+    * A step configured before multi-service support has no `services` array, so its legacy
+    * single-image fields are read as a one-element list. That keeps an existing pipeline behaving
+    * exactly as it did, which matters because these are edited by hand in the admin UI and a
+    * silent change of meaning would be invisible until a replica ran the wrong thing.
     */
-   private async buildReplicaImage(
+   private serviceSpecs(stepConfig: DeploymentStepConfig, projectSlug: string): ReplicaServiceBuildSpec[] {
+      if (stepConfig.services?.length) return stepConfig.services;
+      return [
+         {
+            service: stepConfig.imageService ?? projectSlug,
+            contextSubdir: stepConfig.contextSubdir,
+            dockerfile: stepConfig.dockerfile,
+            imageTarget: stepConfig.imageTarget,
+            imageTag: stepConfig.imageTag,
+            smokePort: stepConfig.smokePort,
+            smokeConfigFile: stepConfig.smokeConfigFile,
+            smokeTest: stepConfig.smokeTest,
+         },
+      ];
+   }
+
+   /**
+    * Expand a `__CWD__`-prefixed path the same way `resolveWorkDir` does.
+    *
+    * Applies to `envFile` and `smokeConfigFile`, which point at files on THIS host rather than
+    * inside the clone — a frontend's `.env` and a service's config are exactly the things a
+    * repository must not carry, so they are addressed relative to the primary's checkout.
+    */
+   private resolveHostPath(p: string): string {
+      if (p === "__CWD__") return process.cwd();
+      if (p.startsWith("__CWD__/")) return path.resolve(process.cwd(), p.slice("__CWD__/".length));
+      return p;
+   }
+
+   /**
+    * Build, prove and stage an image for EVERY service the step configures, from one shared clone.
+    *
+    * All services, not just shado-cloud, because a replica that can take over has to be running
+    * all of them — a mirror needs the file tree, a failover node needs the stack. The delivery
+    * protocol already carried an array keyed by compose service and the replica's updater already
+    * loops over it, so this is the build half catching up.
+    *
+    * One clone shared across every build: each service is a submodule of the superproject, so
+    * cloning once and naming all the needed submodules costs one fetch instead of N, and guarantees
+    * every image in a deployment comes from the same moment in the branch's history.
+    *
+    * FAILS FAST. A service that will not build or will not boot sinks the whole step before
+    * anything is dispatched, because a half-applied set is worse than none: the replica would be
+    * left running a mix of old and new services with no record of which. The smoke test is what
+    * makes this meaningful — the primary runs under pm2 and never from an image, so these images
+    * are otherwise never exercised until a replica tries to start them.
+    */
+   private async buildReplicaImages(
       stepConfig: DeploymentStepConfig,
       projectSlug: string,
       workDir: string,
       projectBranch: string | undefined,
       appendLog: (chunk: string) => void,
-   ): Promise<{ image: ReplicaImageRef; disposeClone?: () => void }> {
+   ): Promise<{ images: ReplicaImageRef[]; disposeClone?: () => void }> {
+      const specs = this.serviceSpecs(stepConfig, projectSlug);
       let disposeClone: (() => void) | undefined;
 
-      // Build from a fresh clone when configured: the image then reflects exactly what is
-      // committed, rather than this host's working tree — which holds a real config.yml,
-      // node_modules, dist/ and possibly uncommitted changes. It also makes the layout inside
-      // the context known, instead of depending on how this host happens to be arranged.
-      let buildDir = workDir;
+      // Build from a fresh clone when configured: the images then reflect exactly what is
+      // committed, rather than this host's working trees — which hold real config.yml files,
+      // node_modules, dist/ and possibly uncommitted changes.
+      let cloneDir = workDir;
       if (stepConfig.sourceRepo) {
          const branch = stepConfig.sourceBranch ?? projectBranch ?? "master";
-         // The build context lives in a submodule, so that submodule has to be checked out at its
-         // branch tip — the superproject's recorded gitlink is not maintained by this pipeline.
-         const clone = await this.imageBuilder.cloneSource(
-            stepConfig.sourceRepo,
-            branch,
-            appendLog,
-            stepConfig.contextSubdir ? [stepConfig.contextSubdir] : [],
-         );
+         // Every context subdir is a submodule, and NOTHING in this project advances the
+         // superproject's gitlinks — so each one must be checked out at its branch tip or the
+         // image is built from whatever commit the pointer was parked on.
+         const submodules = [...new Set(specs.map((s) => s.contextSubdir).filter((s): s is string => !!s))];
+         const clone = await this.imageBuilder.cloneSource(stepConfig.sourceRepo, branch, appendLog, submodules);
          disposeClone = clone.dispose;
-         buildDir = stepConfig.contextSubdir ? path.join(clone.dir, stepConfig.contextSubdir) : clone.dir;
+         cloneDir = clone.dir;
       }
 
+      const images: ReplicaImageRef[] = [];
       try {
-         const tag = stepConfig.imageTag ?? `${projectSlug}:deploy`;
-         const imageId = await this.imageBuilder.build(
-            { workDir: buildDir, dockerfile: stepConfig.dockerfile, target: stepConfig.imageTarget, tag },
-            appendLog,
-         );
+         for (const [i, spec] of specs.entries()) {
+            appendLog(`\n── ${spec.service} (${i + 1}/${specs.length}) ──\n`);
+            const buildDir = spec.contextSubdir ? path.join(cloneDir, spec.contextSubdir) : cloneDir;
 
-         if (stepConfig.smokeTest !== false) {
-            await this.imageBuilder.smokeTest(
-               { imageId, workDir: buildDir, configFile: stepConfig.smokeConfigFile, port: stepConfig.smokePort ?? 9000 },
-               appendLog,
-            );
-         } else {
-            appendLog("Smoke test skipped by step configuration.\n");
+            // Frontends bake their config into the bundle, so the values have to be present for
+            // the build. Removed immediately afterwards, whatever happens.
+            const disposeEnv = spec.envFile
+               ? this.imageBuilder.stageEnvFile(this.resolveHostPath(spec.envFile), buildDir, appendLog)
+               : undefined;
+
+            try {
+               const tag = spec.imageTag ?? `${spec.service}:deploy`;
+               const imageId = await this.imageBuilder.build(
+                  { workDir: buildDir, dockerfile: spec.dockerfile, target: spec.imageTarget, tag },
+                  appendLog,
+               );
+
+               if (spec.smokeTest !== false) {
+                  await this.imageBuilder.smokeTest(
+                     {
+                        imageId,
+                        workDir: buildDir,
+                        configFile: spec.smokeConfigFile ? this.resolveHostPath(spec.smokeConfigFile) : undefined,
+                        port: spec.smokePort ?? 9000,
+                        path: spec.smokePath,
+                     },
+                     appendLog,
+                  );
+               } else {
+                  appendLog(`Smoke test skipped for ${spec.service} by step configuration.\n`);
+               }
+
+               const artifact = await this.imageBuilder.stage(imageId, appendLog);
+               images.push({
+                  service: spec.service,
+                  imageId: artifact.imageId,
+                  tarSha256: artifact.tarSha256,
+                  size: artifact.size,
+                  artifact: artifact.artifact,
+                  // The replica's updater gates the swap on this, so it is deliberately the SAME
+                  // target the smoke test just probed — one definition, verified here and re-checked
+                  // there, rather than a second copy on the replica that can drift out of step.
+                  healthPort: spec.smokePort ?? 9000,
+                  healthPath: spec.smokePath,
+               });
+            } catch (e) {
+               // Name the service in the failure. With one image the step WAS the service, so a
+               // bare "docker build exited with code 1" was unambiguous; across eight builds it
+               // says nothing about which one to go and look at.
+               throw new Error(`${spec.service}: ${(e as Error).message}`);
+            } finally {
+               disposeEnv?.();
+            }
          }
 
-         const artifact = await this.imageBuilder.stage(imageId, appendLog);
-         appendLog("\n");
-         return {
-            disposeClone,
-            image: {
-               service: stepConfig.imageService ?? projectSlug,
-               imageId: artifact.imageId,
-               tarSha256: artifact.tarSha256,
-               size: artifact.size,
-               artifact: artifact.artifact,
-            },
-         };
+         appendLog(`\nBuilt and staged ${images.length} image(s): ${images.map((i) => i.service).join(", ")}\n\n`);
+         return { images, disposeClone };
       } catch (e) {
          // The caller only disposes a clone it was handed back, so clean up on the failure path.
          disposeClone?.();

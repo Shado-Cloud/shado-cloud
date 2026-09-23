@@ -117,3 +117,81 @@ describe("ImageBuildService.cloneSource", () => {
       expect(rmSync).toHaveBeenCalledWith("/tmp/shado-build-test", { recursive: true, force: true });
    });
 });
+
+/**
+ * The only thing that makes a frontend buildable from a clean clone.
+ *
+ * These are `adapter-static` + Vite, so `VITE_*` values are compiled INTO the bundle at build time,
+ * and the `.env` files holding them are gitignored — a fresh clone contains none of them and would
+ * produce a bundle whose API URLs are undefined. The values therefore come from the primary at
+ * build time, and must be gone again afterwards.
+ *
+ * Run against a real temp directory rather than a mocked fs: the whole behaviour is file copying,
+ * and mocking it would only assert that the mock was called.
+ */
+describe("ImageBuildService.stageEnvFile", () => {
+   const fs = require("fs") as typeof import("fs");
+   const os = require("os") as typeof import("os");
+   const nodePath = require("path") as typeof import("path");
+
+   let service: ImageBuildService;
+   let dir: string;
+   let source: string;
+   let context: string;
+
+   beforeEach(() => {
+      service = new ImageBuildService({} as any);
+      dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "stage-env-test-"));
+      source = nodePath.join(dir, "primary.env");
+      context = nodePath.join(dir, "context");
+      fs.mkdirSync(context);
+      fs.writeFileSync(source, "VITE_API_URL=https://cloud.example.com\n");
+   });
+
+   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+   it("copies the env file into the context as .env", () => {
+      service.stageEnvFile(source, context, () => {});
+
+      // `.env` specifically, because that is where Vite looks.
+      expect(fs.readFileSync(nodePath.join(context, ".env"), "utf-8")).toContain("VITE_API_URL=https://cloud.example.com");
+   });
+
+   it("removes it again via the disposer", () => {
+      const dispose = service.stageEnvFile(source, context, () => {});
+      dispose();
+
+      // Must not survive the build: a later build in the same directory would otherwise inherit
+      // another service's configuration.
+      expect(fs.existsSync(nodePath.join(context, ".env"))).toBe(false);
+   });
+
+   it("restores a pre-existing .env rather than destroying it", () => {
+      const target = nodePath.join(context, ".env");
+      fs.writeFileSync(target, "PRE=existing\n");
+
+      const dispose = service.stageEnvFile(source, context, () => {});
+      expect(fs.readFileSync(target, "utf-8")).toContain("VITE_API_URL");
+      dispose();
+
+      expect(fs.readFileSync(target, "utf-8")).toBe("PRE=existing\n");
+   });
+
+   /*
+    * Refused, not skipped. A frontend built with no env produces a bundle that loads and then fails
+    * every request — far harder to diagnose than a build that stops here and names the path.
+    */
+   it("throws when the source does not exist on this host", () => {
+      expect(() => service.stageEnvFile(nodePath.join(dir, "missing.env"), context, () => {})).toThrow(
+         /does not exist on this host/,
+      );
+      expect(fs.existsSync(nodePath.join(context, ".env"))).toBe(false);
+   });
+
+   it("reports what it staged, so the deploy log records where the values came from", () => {
+      const lines: string[] = [];
+      service.stageEnvFile(source, context, (c) => lines.push(c));
+
+      expect(lines.join("")).toContain(source);
+   });
+});

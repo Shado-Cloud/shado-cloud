@@ -91,6 +91,19 @@ export interface ReplicaImageRef {
    size: number;
    /** Opaque artifact id to download from the master: GET /replication/image/:artifact */
    artifact: string;
+   /**
+    * Port inside the container serving health, for the replica updater's post-swap gate.
+    *
+    * Travels WITH the image rather than being configured on the replica, so the updater gates on
+    * exactly what the master smoke-tested and the two cannot drift. It also stops being guessable:
+    * with several services the updater has no way to know which port belongs to the container it
+    * just recreated, and defaulting would silently verify one service against another's health.
+    *
+    * Optional so an older master, which only ever sent one image, still works.
+    */
+   healthPort?: number;
+   /** Path serving health. Defaults to `/health`. */
+   healthPath?: string;
 }
 
 /** One step of the replica's own, locally-configured pipeline. */

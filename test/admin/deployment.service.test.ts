@@ -10,6 +10,7 @@ import { DeploymentProject } from "src/models/admin/deploymentProject";
 import { ReplicaPropagationService } from "src/admin/replica-propagation.service";
 import { ImageBuildService } from "src/admin/image-build.service";
 import * as childProcess from "child_process";
+import * as path from "path";
 import { EventEmitter } from "events";
 
 jest.mock("child_process");
@@ -52,12 +53,18 @@ const backendSteps = [
       buildImage: true,
       sourceRepo: "git@github.com:Shado-Cloud/Shado-Cloud-Services.git",
       sourceBranch: "main",
-      contextSubdir: "shado-cloud",
-      dockerfile: "../Dockerfile.shado-cloud",
-      imageTarget: "runtime",
-      imageTag: "shado-cloud:deploy",
-      imageService: "shado-cloud",
-      smokePort: 9000,
+      // Mirrors the KEY SET of the current default step, which is what reconciliation compares —
+      // a missing key here would make the "does nothing" tests below fail for the wrong reason.
+      services: [
+         {
+            service: "shado-cloud",
+            contextSubdir: "shado-cloud",
+            dockerfile: "../Dockerfile.shado-cloud",
+            imageTarget: "runtime",
+            imageTag: "shado-cloud:deploy",
+            smokePort: 9000,
+         },
+      ],
    },
 ];
 
@@ -556,6 +563,10 @@ describe("DeploymentService", () => {
                tarSha256: "a".repeat(64),
                size: 2 * 1024 * 1024 * 1024,
                artifact: "a".repeat(32),
+               // Carried so the replica's updater gates the swap on the SAME target the smoke test
+               // just probed, instead of guessing which port belongs to the container it recreated.
+               healthPort: 9000,
+               healthPath: undefined,
             },
          ]);
       });
@@ -710,6 +721,214 @@ describe("DeploymentService", () => {
       });
    });
 
+   describe("building every service for a failover replica", () => {
+      const multiSteps = [
+         { step: "build", name: "Build", cmd: "npm", args: ["run", "build"] },
+         {
+            step: "propagate_replicas",
+            name: "Propagate to Replicas",
+            cmd: "",
+            args: [],
+            propagateToReplicas: true,
+            buildImage: true,
+            sourceRepo: "git@github.com:Shado-Cloud/Shado-Cloud-Services.git",
+            sourceBranch: "main",
+            services: [
+               { service: "shado-cloud", contextSubdir: "shado-cloud", dockerfile: "../Dockerfile.shado-cloud", imageTarget: "runtime", smokePort: 9000 },
+               { service: "shado-auth-api", contextSubdir: "shado-auth-api", dockerfile: "../Dockerfile.nestjs", imageTarget: "runtime", smokePort: 11001, smokeTest: false },
+               { service: "shado-cloud-frontend", contextSubdir: "shado-cloud-frontend", dockerfile: "../Dockerfile.sveltekit", imageTarget: "runtime", smokePort: 80, envFile: "__CWD__/../shado-cloud-frontend/.env" },
+            ],
+         },
+      ];
+      let disposeEnv: jest.Mock;
+
+      beforeEach(() => {
+         disposeEnv = jest.fn();
+         imageBuilder.stageEnvFile = jest.fn().mockReturnValue(disposeEnv);
+         // A distinct image per build, so the per-service refs can be told apart.
+         let n = 0;
+         imageBuilder.build.mockImplementation(async () => `sha256:image${++n}`);
+         imageBuilder.stage.mockImplementation(async (imageId: string) => ({
+            artifact: imageId.slice(-1).repeat(32),
+            imageId,
+            tarSha256: imageId.slice(-1).repeat(64),
+            size: 1024 * 1024,
+         }));
+         projectRepo.findOneBy.mockImplementation(({ slug }: any) =>
+            Promise.resolve(slug === "multi" ? makeProject("multi", multiSteps) : null),
+         );
+      });
+
+      async function runMulti() {
+         const mockProc = createMockProc();
+         mockSpawnWithPwd(mockProc);
+         const subject = await service.startDeployment("multi", "admin");
+         const events: any[] = [];
+         subject.subscribe((event) => events.push(JSON.parse((event as any).data)));
+         await new Promise((r) => setTimeout(r, 50));
+         mockProc.emit("close", 0);
+         await new Promise((r) => setTimeout(r, 200));
+         return events;
+      }
+
+      it("builds and stages one image per configured service", async () => {
+         await runMulti();
+
+         expect(imageBuilder.build).toHaveBeenCalledTimes(3);
+         expect(imageBuilder.stage).toHaveBeenCalledTimes(3);
+
+         const [propagateOpts] = replicaPropagation.propagate.mock.calls[0];
+         expect(propagateOpts.images.map((i: any) => i.service)).toEqual([
+            "shado-cloud", "shado-auth-api", "shado-cloud-frontend",
+         ]);
+      });
+
+      /*
+       * One clone, not one per service. Each service is a submodule of the superproject, so cloning
+       * once costs a single fetch instead of N — and, more importantly, guarantees every image in a
+       * deployment comes from the same moment in the branch's history rather than from N fetches
+       * that could straddle a push.
+       */
+      it("clones once and names every context submodule", async () => {
+         await runMulti();
+
+         expect(imageBuilder.cloneSource).toHaveBeenCalledTimes(1);
+         expect(imageBuilder.cloneSource.mock.calls[0][3]).toEqual([
+            "shado-cloud", "shado-auth-api", "shado-cloud-frontend",
+         ]);
+         // Each build context is its own subdirectory of that one clone.
+         expect(imageBuilder.build.mock.calls.map((c: any[]) => c[0].workDir)).toEqual([
+            "/tmp/shado-build-xyz/shado-cloud",
+            "/tmp/shado-build-xyz/shado-auth-api",
+            "/tmp/shado-build-xyz/shado-cloud-frontend",
+         ]);
+      });
+
+      it("carries each service's health target to the replica", async () => {
+         await runMulti();
+
+         const [propagateOpts] = replicaPropagation.propagate.mock.calls[0];
+         expect(propagateOpts.images.map((i: any) => [i.service, i.healthPort])).toEqual([
+            ["shado-cloud", 9000],
+            ["shado-auth-api", 11001],
+            ["shado-cloud-frontend", 80],
+         ]);
+      });
+
+      it("honours per-service smoke settings", async () => {
+         await runMulti();
+
+         // auth-api opts out (it needs a database to boot); the other two are probed.
+         expect(imageBuilder.smokeTest).toHaveBeenCalledTimes(2);
+         expect(imageBuilder.smokeTest.mock.calls.map((c: any[]) => c[0].port)).toEqual([9000, 80]);
+      });
+
+      describe("build-time env for the frontends", () => {
+         it("stages the env file into the frontend's context and removes it afterwards", async () => {
+            await runMulti();
+
+            expect(imageBuilder.stageEnvFile).toHaveBeenCalledTimes(1);
+            const [src, contextDir] = imageBuilder.stageEnvFile.mock.calls[0];
+            // __CWD__ expands against the primary's checkout: the values live on THIS host,
+            // deliberately not in the repository.
+            expect(src).toBe(path.resolve(process.cwd(), "../shado-cloud-frontend/.env"));
+            expect(contextDir).toBe("/tmp/shado-build-xyz/shado-cloud-frontend");
+            // Removed whatever happens, so it cannot be picked up by a later build.
+            expect(disposeEnv).toHaveBeenCalledTimes(1);
+         });
+
+         it("removes the staged env file even when that service's build fails", async () => {
+            imageBuilder.build.mockImplementation(async (opts: any) => {
+               if (opts.workDir.endsWith("shado-cloud-frontend")) throw new Error("vite build failed");
+               return "sha256:ok";
+            });
+
+            await runMulti();
+
+            expect(disposeEnv).toHaveBeenCalledTimes(1);
+         });
+
+         /*
+          * A frontend built with no env produces a bundle that loads and then fails every request,
+          * which is far harder to diagnose than a failed build — so a missing env file must stop
+          * the step rather than be skipped.
+          */
+         it("fails the step when the env file is missing on this host", async () => {
+            imageBuilder.stageEnvFile.mockImplementation(() => {
+               throw new Error("Env file /nope/.env does not exist on this host.");
+            });
+
+            await runMulti();
+
+            const deployment = await service.getCurrentDeployment();
+            expect(deployment?.status).toBe("failed");
+            expect(deployment?.currentStep.error).toContain("does not exist on this host");
+            expect(replicaPropagation.propagate).not.toHaveBeenCalled();
+         });
+      });
+
+      /*
+       * Fail fast across the set. A half-applied stack is worse than none: the replica would be left
+       * running a mix of old and new services with no record of which, so nothing is dispatched
+       * unless every image is built and staged.
+       */
+      it("dispatches nothing when any one service fails to build", async () => {
+         imageBuilder.build.mockImplementation(async (opts: any) => {
+            if (opts.workDir.endsWith("shado-auth-api")) throw new Error("docker build exited with code 1");
+            return "sha256:ok";
+         });
+
+         await runMulti();
+
+         const deployment = await service.getCurrentDeployment();
+         expect(deployment?.status).toBe("failed");
+         // Names the service. With one image the step WAS the service; across eight builds a bare
+         // "exited with code 1" says nothing about where to look.
+         expect(deployment?.currentStep.error).toContain("shado-auth-api:");
+         expect(replicaPropagation.propagate).not.toHaveBeenCalled();
+      });
+
+      it("removes the shared clone after a failure part-way through the set", async () => {
+         const dispose = jest.fn();
+         imageBuilder.cloneSource.mockResolvedValue({ dir: "/tmp/shado-build-xyz", dispose });
+         imageBuilder.build.mockImplementation(async (opts: any) => {
+            if (opts.workDir.endsWith("shado-auth-api")) throw new Error("boom");
+            return "sha256:ok";
+         });
+
+         await runMulti();
+
+         expect(dispose).toHaveBeenCalledTimes(1);
+      });
+
+      /*
+       * A step written before multi-service support has no `services` array. It must keep building
+       * exactly the one image it always did — these are hand-edited in the admin UI, so a silent
+       * change of meaning would be invisible until a replica ran the wrong thing.
+       */
+      it("still builds a single image from the legacy fields when services is absent", async () => {
+         const legacy = [
+            { step: "build", name: "Build", cmd: "npm", args: ["run", "build"] },
+            {
+               step: "propagate_replicas", name: "Propagate to Replicas", cmd: "", args: [],
+               propagateToReplicas: true, buildImage: true,
+               dockerfile: "../Dockerfile.shado-cloud", imageTarget: "runtime",
+               imageTag: "shado-cloud:deploy", imageService: "shado-cloud", smokePort: 9000,
+            },
+         ];
+         projectRepo.findOneBy.mockImplementation(({ slug }: any) =>
+            Promise.resolve(slug === "multi" ? makeProject("multi", legacy) : null),
+         );
+
+         await runMulti();
+
+         expect(imageBuilder.build).toHaveBeenCalledTimes(1);
+         expect(imageBuilder.build.mock.calls[0][0]).toMatchObject({ tag: "shado-cloud:deploy", target: "runtime" });
+         const [propagateOpts] = replicaPropagation.propagate.mock.calls[0];
+         expect(propagateOpts.images.map((i: any) => i.service)).toEqual(["shado-cloud"]);
+      });
+   });
+
    describe("default step reconciliation", () => {
       /**
        * seedDefaults used to only INSERT projects, so a step added to the defaults never reached an
@@ -756,8 +975,44 @@ describe("DeploymentService", () => {
             .getSteps().find(s => s.step === "propagate_replicas");
          expect(step?.buildImage).toBe(true);
          expect(step?.sourceRepo).toContain("Shado-Cloud-Services");
-         expect(step?.contextSubdir).toBe("shado-cloud");
-         expect(step?.dockerfile).toBe("../Dockerfile.shado-cloud");
+         expect(step?.services?.length).toBeGreaterThan(1);
+      });
+
+      /*
+       * The point of the v4 bump: an install that predates multi-service support builds shado-cloud
+       * alone, which is not enough for a replica to take over. `services` is absent from such a
+       * step, so field-level merging delivers the whole list.
+       */
+      it("gives an existing pipeline the full service list, not just shado-cloud", async () => {
+         const singleImage = backendSteps.map(s =>
+            s.step === "propagate_replicas"
+               ? {
+                    step: s.step, name: s.name, cmd: "", args: [], propagateToReplicas: true,
+                    buildImage: true, sourceRepo: s.sourceRepo, sourceBranch: "main",
+                    contextSubdir: "shado-cloud", dockerfile: "../Dockerfile.shado-cloud",
+                    imageTarget: "runtime", imageTag: "shado-cloud:deploy", imageService: "shado-cloud",
+                    smokePort: 9000,
+                 }
+               : s,
+         );
+         projectRepo.findOneBy.mockResolvedValue(makeProject("backend", singleImage));
+
+         await service.onModuleInit();
+
+         const step = (projectRepo.save.mock.calls.at(-1)[0] as DeploymentProject)
+            .getSteps().find(s => s.step === "propagate_replicas");
+         const services = step?.services ?? [];
+         expect(services.map(s => s.service)).toEqual(
+            expect.arrayContaining([
+               "shado-cloud", "shado-auth-api", "shado-metrics", "shado-music-api",
+               "shado-gym-api", "shado-cloud-frontend", "shado-music-frontend", "shado-gym-app",
+            ]),
+         );
+         // Frontends bake their config at build time and their .env is gitignored, so a clean clone
+         // cannot build them without a value supplied from this host.
+         expect(services.find(s => s.service === "shado-cloud-frontend")?.envFile).toContain(".env");
+         // The legacy fields survive untouched but go inert — serviceSpecs() prefers `services`.
+         expect(step?.imageService).toBe("shado-cloud");
       });
 
       it("does not overwrite a build setting the operator already chose", async () => {
