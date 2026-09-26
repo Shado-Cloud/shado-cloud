@@ -1,4 +1,5 @@
 import { Test, type TestingModule } from "@nestjs/testing";
+import { Readable } from "stream";
 import { FilesService } from "src/files/files.service"; // Replace with your actual service path
 import ThumbnailGenerator from "fs-thumbnail";
 import sharp from "sharp";
@@ -516,18 +517,91 @@ describe("FilesService", () => {
          service.createMetaFolderIfNotExists = jest.fn().mockResolvedValue(metaDir);
 
          let thumbnailPath = "";
+         const resized = Buffer.from("resized jpeg bytes");
          fs.createReadStream = jest.fn().mockImplementation((path: string) => {
             thumbnailPath = path;
             return {
                pipe: jest.fn().mockReturnValue({
-                  toFile: jest.fn().mockReturnValue("thumbnail presisted to file"),
+                  toBuffer: jest.fn().mockResolvedValue(resized),
                }),
             };
          });
 
          const result = await service.toThumbnail("test/path.jpg", 1, 120, 100);
-         expect(result).toBeDefined(); // assuming the result would be a stream
-         expect(thumbnailPath).toBe(`${metaDir}/${FilesService.THUMBNAILS_FOLDER_NAME}/${mockFile.id}_120x100.jpg`);
+         // Only the SOURCE is read from disk; the thumbnail is persisted in one synchronous write
+         // and served from memory.
+         expect(thumbnailPath).not.toContain(FilesService.THUMBNAILS_FOLDER_NAME);
+         expect(fs.writeFileSync).toHaveBeenCalledWith(
+            `${metaDir}/${FilesService.THUMBNAILS_FOLDER_NAME}/${mockFile.id}_120x100.jpg`,
+            resized,
+         );
+         const chunks: Buffer[] = [];
+         for await (const c of result as AsyncIterable<Buffer>) chunks.push(c);
+         expect(Buffer.concat(chunks)).toEqual(resized);
+      });
+
+      it("never exposes a partially written thumbnail to a concurrent request for the same size", async () => {
+         // Regression: toFile() created the cache file up front and filled it asynchronously, so a
+         // second request passing the existsSync() check mid-resize streamed a 0-byte image, which
+         // the Redis interceptor then cached for 30 days (song 3694 @ width=256).
+         const metaDir = "/meta";
+         const thumb = `${metaDir}/${FilesService.THUMBNAILS_FOLDER_NAME}/1_256xundefined.jpg`;
+         FilesService.detectFile = jest.fn().mockReturnValue("image/jpeg");
+         service.isOwner = jest.fn().mockResolvedValue(true);
+         uploadedFileRepo.findOne = jest.fn().mockResolvedValue({ id: 1 });
+         service.createMetaFolderIfNotExists = jest.fn().mockResolvedValue(metaDir);
+
+         // In-memory disk: the source exists; the thumbnail only once something writes it.
+         const disk = new Map<string, Buffer>();
+         let thumbChecks = 0;
+         let secondChecked!: () => void;
+         const secondHasChecked = new Promise<void>((r) => (secondChecked = r));
+         fs.existsSync = jest.fn().mockImplementation((p: string) => {
+            if (!p.includes(FilesService.THUMBNAILS_FOLDER_NAME)) return true;
+            if (p === thumb && ++thumbChecks === 2) secondChecked();
+            return disk.has(p);
+         });
+         fs.writeFileSync = jest.fn().mockImplementation((p: string, b: Buffer) => disk.set(p, b));
+
+         // The first resize is slow and doesn't finish until we say so.
+         const resized = Buffer.from("complete 256px jpeg");
+         let finishResize!: () => void;
+         let resizeStarted!: () => void;
+         const started = new Promise<void>((r) => (resizeStarted = r));
+         const slowResize = new Promise<Buffer>((r) => (finishResize = () => r(resized)));
+         const readsOfThumb: Buffer[] = [];
+         fs.createReadStream = jest.fn().mockImplementation((p: string) => {
+            if (p === thumb) {
+               const bytes = disk.get(p) ?? Buffer.alloc(0);
+               readsOfThumb.push(bytes);
+               return Readable.from(bytes);
+            }
+            const toBuffer = jest.fn().mockImplementation(() => {
+               resizeStarted();
+               return slowResize;
+            });
+            // Mirrors real libvips toFile(): the target exists (empty) immediately, bytes land later.
+            const toFile = jest.fn().mockImplementation(async (target: string) => {
+               disk.set(target, Buffer.alloc(0));
+               resizeStarted();
+               disk.set(target, await slowResize);
+            });
+            return { pipe: jest.fn().mockReturnValue({ toBuffer, toFile }) };
+         });
+
+         const first = service.toThumbnail("Music/yjAWKh4W19k.jpg", 1, 256);
+         await started; // first request is now mid-resize
+         const second = service.toThumbnail("Music/yjAWKh4W19k.jpg", 1, 256);
+         await secondHasChecked; // second request has hit the disk-cache check while the first is still writing
+         finishResize();
+
+         for (const stream of await Promise.all([first, second])) {
+            const chunks: Buffer[] = [];
+            for await (const c of stream as AsyncIterable<Buffer>) chunks.push(c);
+            expect(Buffer.concat(chunks)).toEqual(resized);
+         }
+         // Nobody ever read the cache file before it held the full image.
+         readsOfThumb.forEach((b) => expect(b).toEqual(resized));
       });
 
       it("should generate and return a video thumbnail", async () => {

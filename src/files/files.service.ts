@@ -605,10 +605,17 @@ export class FilesService {
                thumbnailFolder,
                `${uploadedFile.id}_${width}x${height}${path.extname(path_)}`,
             );
-            await readStream.toFile(thumbnailPath);
+            // Resize fully in memory, then persist with a synchronous write. Never toFile() here:
+            // libvips creates the target up front and fills it in 8 KB chunks from a worker thread,
+            // so the cache check above (existsSync) let a concurrent request for the same size
+            // stream a still-empty/truncated file — which ThumbnailCacheInterceptor then pinned in
+            // Redis for 30 days. writeFileSync completes before any other request on this process
+            // can run, so the cached file is never observable half-written.
+            const buffer = await readStream.toBuffer();
+            this.fs.writeFileSync(thumbnailPath, buffer);
 
             this.logger.debug(`[${this.toThumbnail.name}] Created cached thumbnail at ${thumbnailPath}`);
-            return this.fs.createReadStream(thumbnailPath);
+            return Readable.from(buffer);
          }
 
          if (!uploadedFile)
