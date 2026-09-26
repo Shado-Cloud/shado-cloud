@@ -2,7 +2,7 @@ import { Injectable, Inject, OnModuleInit, Logger } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { spawn } from "child_process";
 import * as path from "path";
-import { Subject } from "rxjs";
+import { concat, defer, EMPTY, Observable, of, Subject } from "rxjs";
 import { EnvVariables } from "src/config/config.validator";
 import { EmailService } from "./email.service";
 import { FeatureFlagService } from "./feature-flag.service";
@@ -63,7 +63,14 @@ interface DeploymentEvent {
       /** Terminal propagation snapshot. */
       | "replica_done"
       /** The propagation step finished building and staging its image. */
-      | "replica_image_staged";
+      | "replica_image_staged"
+      /**
+       * First event on a (re)connecting /deployment/stream: the running deployment as it stands
+       * in memory, output included. Events are deltas, so without it a client that connects
+       * mid-step (after the primary restarts, or on a page load) only sees output from that
+       * moment on — Redis holds the step's output only as of its last boundary.
+       */
+      | "snapshot";
    step?: string;
    output?: string;
    status?: StepStatus;
@@ -359,6 +366,8 @@ const DEFAULT_PROJECTS: Partial<DeploymentProject>[] = [
 @Injectable()
 export class DeploymentService implements OnModuleInit {
    private deploymentSubject: Subject<MessageEvent> | null = null;
+   /** The deployment runSteps is executing — the live object its steps mutate, not a Redis copy. */
+   private activeDeployment: DeploymentState | null = null;
    private currentProcess: ReturnType<typeof spawn> | null = null;
    private cancelled = false;
 
@@ -594,6 +603,26 @@ export class DeploymentService implements OnModuleInit {
 
    public getSubject(): Subject<MessageEvent> | null {
       return this.deploymentSubject;
+   }
+
+   /**
+    * The live stream for a client joining a deployment already in progress: a snapshot of the
+    * running deployment, then every event after it.
+    *
+    * The snapshot is taken at subscribe time and the subject is subscribed in the same
+    * synchronous turn (concat subscribes to the next source as soon as `of` completes), so no
+    * event can fall between them. Emits happen from I/O callbacks, never mid-turn.
+    */
+   public getStream(): Observable<MessageEvent> | null {
+      const subject = this.deploymentSubject;
+      if (!subject) return null;
+      return defer(() => {
+         const snapshot = this.activeDeployment?.status === "running" ? this.activeDeployment : null;
+         const head = snapshot
+            ? of({ data: JSON.stringify({ type: "snapshot", deployment: snapshot } satisfies DeploymentEvent) } as MessageEvent)
+            : EMPTY;
+         return concat(head, subject.asObservable());
+      });
    }
 
    public async cancelDeployment(): Promise<void> {
@@ -849,6 +878,7 @@ export class DeploymentService implements OnModuleInit {
       const frontendUrl = this.config.get("this-service.frontend_url", { infer: true }) || "";
       const deployPageUrl = `${frontendUrl}/admin/deploy`;
 
+      this.activeDeployment = deployment;
       for (const stepConfig of steps) {
          if (this.cancelled) return;
 

@@ -1321,4 +1321,57 @@ describe("DeploymentService", () => {
          expect(service.getSubject()).not.toBeNull();
       });
    });
+
+   describe("getStream (a client joining a deployment in progress)", () => {
+      it("should return null when no deployment", () => {
+         expect(service.getStream()).toBeNull();
+      });
+
+      it("opens with a snapshot holding the output emitted before the client connected, then streams on with nothing dropped", async () => {
+         // The scenario behind "no build logs until the step fails": the primary restarts mid-
+         // pipeline, the UI reconnects to /deployment/stream while a step is already running, and
+         // Redis only has that step's output as of its start. The stream must catch the client up.
+         const mockProc = new EventEmitter() as any;
+         mockProc.stdout = new EventEmitter();
+         mockProc.stderr = new EventEmitter();
+         mockSpawnWithPwd(mockProc);
+
+         await service.startDeployment("backend", "test");
+         await new Promise((r) => setTimeout(r, 50));
+         mockProc.stdout.emit("data", Buffer.from("emitted before the client joined\n"));
+
+         const events: any[] = [];
+         service.getStream()!.subscribe((event) => events.push(JSON.parse((event as any).data)));
+         mockProc.stdout.emit("data", Buffer.from("emitted after\n"));
+
+         expect(events[0].type).toBe("snapshot");
+         expect(events[0].deployment.status).toBe("running");
+         expect(events[0].deployment.currentStep.step).toBe("git_pull");
+         expect(events[0].deployment.currentStep.output).toContain("emitted before the client joined\n");
+         // The live tail follows directly, and the snapshot doesn't already contain it.
+         expect(events[0].deployment.currentStep.output).not.toContain("emitted after");
+         expect(events.slice(1)).toEqual([{ type: "step_output", step: "git_pull", output: "emitted after\n" }]);
+      });
+
+      it("takes the snapshot per subscriber, at the moment each one connects", async () => {
+         const mockProc = new EventEmitter() as any;
+         mockProc.stdout = new EventEmitter();
+         mockProc.stderr = new EventEmitter();
+         mockSpawnWithPwd(mockProc);
+
+         await service.startDeployment("backend", "test");
+         await new Promise((r) => setTimeout(r, 50));
+         const stream = service.getStream()!;
+
+         mockProc.stdout.emit("data", Buffer.from("A\n"));
+         const first: any[] = [];
+         stream.subscribe((e) => first.push(JSON.parse((e as any).data)));
+         mockProc.stdout.emit("data", Buffer.from("B\n"));
+         const second: any[] = [];
+         stream.subscribe((e) => second.push(JSON.parse((e as any).data)));
+
+         expect(first[0].deployment.currentStep.output).toMatch(/A\n$/);
+         expect(second[0].deployment.currentStep.output).toMatch(/A\nB\n$/);
+      });
+   });
 });

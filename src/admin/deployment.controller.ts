@@ -182,11 +182,11 @@ export class DeploymentController {
    @UseGuards(JwtAuthGuard, AdminGuard)
    @Sse()
    public streamDeployment(): Observable<MessageEvent> {
-      const subject = this.deploymentService.getSubject();
+      const subject = this.deploymentService.getStream();
       if (!subject) {
          throw new HttpException("No deployment in progress", HttpStatus.NOT_FOUND);
       }
-      return subject.asObservable();
+      return subject;
    }
 
    @Get("deployment/start/:project")
